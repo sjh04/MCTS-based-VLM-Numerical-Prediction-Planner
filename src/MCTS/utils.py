@@ -567,3 +567,4 @@ def trajectory2action(trajectory, dt=0.5):
     acc = np.mean(accs[:2])
 
     return acc, st2, None
+
