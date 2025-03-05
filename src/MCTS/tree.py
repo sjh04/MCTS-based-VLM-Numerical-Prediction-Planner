@@ -3,6 +3,8 @@ from __future__ import annotations
 from time import perf_counter
 
 import numpy as np
+import carla
+from typing import Dict, List, Tuple, Optional
 
 from nuplan.planning.training.modeling.models.np_mcts_bicycle_node import Node
 from nuplan.planning.training.modeling.models.np_mcts_bicycle_utils import (
@@ -16,47 +18,99 @@ from nuplan.planning.training.modeling.models.np_mcts_bicycle_utils import (
 
 class Tree:
     """
-    Class describing the full MCTS tree handling the planning
+    MCTS tree class, used for path planning in CARLA environment
     """
 
     def __init__(
         self,
-        init_state: dict,
+        world: carla.World,
+        ego_vehicle: carla.Vehicle,
+        init_state: Dict,
         policy,
-        graph_encoding=None,
-        prediction=None,
-        action=None,
-        root=None,
-        pred_idx=None,
-        prior=(None, None),
-        count=0,
+        action: Optional[Tuple[float, float]] = None,
+        root: Optional[Node] = None,
+        count: int = 0,
     ):
         """
+        Initialize MCTS tree
         Args:
-            init_state: initial state of the tree
-            policy: policy used to evaluate the nodes
-            graph_encoding: graph encoding used to encode the map
-            prediction: prediction of the agents
+            world: CARLA world object
+            ego_vehicle: ego vehicle object
+            init_state: initial state
+            policy: policy network
             action: initial action
-            root: root node of the tree
-            pred_idx: index of the prediction to use
-            prior: prior of the root node
-            count: number of simulations
+            root: root node
+            count: simulation count
         """
-
+        self.world = world
+        self.ego_vehicle = ego_vehicle
         self.count = count
+        
+        # Action space parameters
+        self.acc_target_range = [-3, 3]  # acceleration range
+        self.steering_target_range = [-np.pi/4, np.pi/4]  # steering angle range
+        self.acc_values = 13  # number of acceleration discretization
+        self.steering_values = 13  # number of steering angle discretization
+        
+        # Action space coefficients
+        self.acc_coef = (self.acc_target_range[1] - self.acc_target_range[0]) / (self.acc_values - 1)
+        self.steer_coef = (self.steering_target_range[1] - self.steering_target_range[0]) / (self.steering_values - 1)
+        
+        # Default action space
+        self.default_possible_actions = np.arange(self.steering_values * self.acc_values)
+        self.default_global2possible = {
+            self.default_possible_actions[i]: i for i in range(len(self.default_possible_actions))
+        }
+        
+        # Masks and penalties
+        self.masks = {}
+        self.masks_action = {}
+        self.dt = 0.1  # time step
+        
+        # Vehicle parameters
+        self.rear2center = 1.461  # distance from rear axle to center of mass
+        self.wheel_base = 3.1  # wheelbase
+        self.max_speed = init_state["max_speed"]
+        
+        # Tree parameters
+        self.n_nodes = 1
+        self.Ts = np.zeros(81)
+        self.nodes = {}
+        self.mask_init = None
+        self.penalty_init = None
+        
+        # Initialize root node
+        if root is not None:
+            self.root = root
+            root.T = 0
+        else:
+            self.root = Node(0, None, self, state=init_state, parent_state=init_state, action=action)
+            
+        self.policy = policy
+        self.max_T = 80  # maximum time step
+        self.frames_history = 10  # number of history frames
+        self.n_actions = self.acc_values * self.steering_values
+        self.eval_frames = 10  # number of evaluation frames
+        self.action_frames = 30  # number of action frames
+        self.eval_ratio = 5
+        
+        # MCTS parameters
+        self.c_puct = 2  # PUCT exploration coefficient
+        self.tau = 1
+        self.relu = lambda x: x * (x > 0)
+        
+        # Initialization flags
+        self.first = True
+        self.no_goal = False
+        self.no_drive = False
 
         self.margin = 0.5
-        self.pred_idx = pred_idx
-
+        self.pred_idx = None
         self.disp = False
         self.start_time = init_state["start_time"]
         self.prior = None
-        if prior[0] is not None:
-            self.prior = prior
-
-        self.acc_target_range = [-3, 3]
-        self.steering_target_range = [-np.pi / 4, np.pi / 4]
+        if init_state["prior"][0] is not None:
+            self.prior = init_state["prior"]
 
         self.acc_values = 13
         self.steering_values = 13
@@ -134,20 +188,14 @@ class Tree:
             init_state["agents_dim"] = init_state["agents_dim"][0][~is_collision[0]][None]
             init_state["prediction"] = init_state["prediction"][0][~is_collision[0]][None]
 
-        if root is not None:
-            self.root = root
-            root.T = 0
-        else:
-            self.root = Node(0, None, self, state=init_state, parent_state=init_state, action=action)
-
         self.policy = policy
-        self.map_encoding = graph_encoding
+        self.map_encoding = None
 
         self.max_T = 80
 
         self.frames_history = 10
         self.n_actions = self.acc_values * self.steering_values
-        self.prediction = prediction
+        self.prediction = None
 
         self.eval_frames = 10
         self.action_frames = 30
@@ -240,6 +288,15 @@ class Tree:
         self.acc_coef = (self.acc_target_range[1] - self.acc_target_range[0]) / (self.acc_values - 1)
 
     def simulate(self, k=128):
+        """
+        Execute MCTS simulation
+        Args:
+            k: number of simulations
+        Returns:
+            acc_ns: acceleration sequence
+            yr_ns: steering angle sequence
+            best_T: best time step
+        """
         start_time = perf_counter()
         self.k = k
         self.root.expand()
@@ -265,6 +322,15 @@ class Tree:
         return self.get_probas(), best_T
 
     def search(self):
+        """
+        Execute MCTS search
+        Returns:
+            t: time step
+            value: node value
+            failure: whether failed
+            success: whether successful
+            s_node: success node
+        """
         success = False
         leaf, value, path = self.root.select([])
         sucess_node = False
@@ -292,11 +358,11 @@ class Tree:
 
     def get_probas(self):
         """
+        Get action probability distribution
         Returns:
-            acc_ns: acceleration value
-            yr_ns: yaw rate value
+            acc_ns: acceleration sequence
+            yr_ns: steering angle sequence
         """
-
         n_frames = self.action_frames
         actions = np.zeros((80, self.acc_values * self.steering_values))
         actions_q = np.zeros((n_frames, self.acc_values * self.steering_values))
@@ -310,31 +376,34 @@ class Tree:
 
     def ctridx2pos(self, acc, st, dt, initial_pos, initial_speed, initial_yaw):
         """
+        Convert control inputs to positions
         Args:
-            acc: acceleration value
-            st: yaw rate value
+            acc: acceleration sequence
+            st: steering angle sequence
             dt: time step
             initial_pos: initial position
             initial_speed: initial speed
-            initial_yaw: initial yaw
+            initial_yaw: initial heading angle
+        Returns:
+            pred_pos: predicted position
+            pred_speed: predicted speed
+            pred_yaw: predicted heading angle
         """
+        # Convert discrete actions to continuous actions
+        discrete_acc = (self.acc_target_range[1] - self.acc_target_range[0]) * acc / (self.acc_values - 1) + self.acc_target_range[0]
+        discrete_steer = (self.steering_target_range[1] - self.steering_target_range[0]) * st / (self.steering_values - 1) + self.steering_target_range[0]
 
-        acc_values = self.acc_values
-        steering_values = self.steering_values
-
-        discrete_acc = (self.acc_target_range[1] - self.acc_target_range[0]) * acc / (
-            acc_values - 1
-        ) + self.acc_target_range[0]
-        discrete_steer = (self.steering_target_range[1] - self.steering_target_range[0]) * st / (
-            steering_values - 1
-        ) + self.steering_target_range[0]
-
+        # Calculate speed
         pred_speed = initial_speed + np.cumsum(discrete_acc, -1) * dt
         pred_speed = self.relu(pred_speed)
 
+        # Calculate steering angle velocity
         discrete_yr = pred_speed * np.tan(discrete_steer) / self.wheel_base
 
+        # Calculate heading angle
         pred_yaw = initial_yaw + np.cumsum(discrete_yr, -1) * dt
+        
+        # Calculate position
         yaw_vec = np.stack([np.cos(pred_yaw), np.sin(pred_yaw)], -1)
         pred_velocity = yaw_vec * pred_speed[..., None]
         pred_pos = initial_pos[:, None] + np.cumsum(pred_velocity, 1) * dt
@@ -395,6 +464,7 @@ class Tree:
 
     def compute_map_infos(self, map, map_mask, th=0.1):
         """
+        Compute map information
         Args:
             map: map to use
             map_mask: mask of the map
@@ -447,12 +517,16 @@ class Tree:
 
     def get_action_masks(self, action, value, dt=1):
         """
+        Get action masks
         Args:
-            action: action to use
-            value: value to use
+            action: current action
+            value: current speed
             dt: time step
+        Returns:
+            mask_action: action mask
+            continuity_penalty: continuity penalty
+            total_mask: total mask
         """
-
         if action is not None:
             a, st = action
             key = (a, st, value // 0.1)
@@ -502,17 +576,24 @@ class Tree:
 
     def get_action_value_mask(self, action, stopped, dt):
         """
+        Get action value mask
         Args:
-            action: action to use
-            stopped: whether the vehicle is stopped
+            action: current action
+            stopped: whether stopped
             dt: time step
+        Returns:
+            mask_a: acceleration mask
+            mask_st: steering angle mask
+            acc_pen: acceleration penalty
+            st_pen: steering angle penalty
+            lon_jerk: longitudinal jerk
         """
-
         if action is not None:
             a, st = action
             key = (a, st, stopped)
         else:
             key = stopped
+            
         if key not in self.masks_action:
             acc_values, steering_values = self.acc_values, self.steering_values
 

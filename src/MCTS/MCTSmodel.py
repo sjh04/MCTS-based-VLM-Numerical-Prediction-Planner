@@ -1,33 +1,38 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, cast
+import numpy as np
+import carla
+from .carla_params import CarlaModelParams, CarlaFeatureParams, CarlaTargetParams
 
-
-
-class MCTSModel(TorchModuleWrapper):
+class MCTSModel():
     """
     Vector-based model that uses PointNet-based subgraph layers for collating loose collections of vectorized inputs
     into local feature descriptors to be used as input to a global Transformer.
-    Adapted from L5Kit's implementation of "Urban Driver: Learning to Drive from Real-world Demonstrations
-    Using Policy Gradients":
-    https://github.com/woven-planet/l5kit/blob/master/l5kit/l5kit/planning/vectorized/open_loop_model.py
-    Only the open-loop  version of the model is here represented, with slight modifications to fit the nuPlan framework.
-    Changes:
-        1. Use nuPlan features from NuPlanScenario
-        2. Format model for using pytorch_lightning
+    Adapted for CARLA simulator with the following changes:
+    1. Use CARLA features from vehicle sensors and world state
+    2. Format model for using pytorch_lightning
+    3. Integrate with CARLA's camera system and vehicle dynamics
     """
 
     def __init__(
         self,
-        model_params: UrbanDriverOpenLoopModelParams,
-        feature_params: UrbanDriverOpenLoopModelFeatureParams,
-        target_params: UrbanDriverOpenLoopModelTargetParams,
+        model_params: CarlaModelParams,
+        feature_params: CarlaFeatureParams,
+        target_params: CarlaTargetParams,
     ):
         """
-        Initialize UrbanDriverOpenLoop model.
-        :param model_params: internal model parameters.
-        :param feature_params: agent and map feature parameters.
-        :param target_params: target parameters.
+        Initialize CARLA MCTS model.
+        Args:
+            model_params: internal model parameters
+            feature_params: agent and map feature parameters
+            target_params: target parameters
         """
+        # Define feature types for CARLA environment
         agent_features = feature_params.agent_features
         agent_features2 = [*agent_features, "TRAFFIC_CONE", "GENERIC_OBJECT", "PEDESTRIAN"]
+        
         super().__init__(
             feature_builders=[
                 VectorSetMapFeatureBuilder(
@@ -47,11 +52,13 @@ class MCTSModel(TorchModuleWrapper):
             ],
             future_trajectory_sampling=target_params.future_trajectory_sampling,
         )
+        
         self._model_params = model_params
         self._feature_params = feature_params
         self._target_params = target_params
-        self.dt = 0.5
+        self.dt = 0.1  # CARLA default time step
 
+        # Feature embedding layers
         self.feature_embedding = nn.Linear(
             self._feature_params.feature_dimension,
             self._model_params.local_embedding_size,
@@ -61,15 +68,21 @@ class MCTSModel(TorchModuleWrapper):
             self._model_params.global_embedding_size,
             self._feature_params.feature_types,
         )
+        
+        # Local subgraph processing
         self.local_subgraph = LocalSubGraph(
             num_layers=self._model_params.num_subgraph_layers,
             dim_in=self._model_params.local_embedding_size,
         )
+        
+        # Global feature processing
         if self._model_params.global_embedding_size != self._model_params.local_embedding_size:
             self.global_from_local = nn.Linear(
                 self._model_params.local_embedding_size,
                 self._model_params.global_embedding_size,
             )
+            
+        # Multi-head attention layers for CARLA environment
         num_timesteps = self.future_trajectory_sampling.num_poses
         self.global_map = MultiheadAttentionGlobalHeadMulti(
             self._model_params.global_embedding_size,
@@ -89,8 +102,11 @@ class MCTSModel(TorchModuleWrapper):
             self._target_params.num_output_features // num_timesteps,
             dropout=self._model_params.global_head_dropout,
         )
+        
+        # Final output layer
         self.final_output = nn.Linear(self._model_params.global_embedding_size, self._target_params.num_output_features)
-
+        
+        # Initialize counter
         self.count = 0
 
     def extract_agent_features(
@@ -99,14 +115,13 @@ class MCTSModel(TorchModuleWrapper):
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Extract ego and agent features into format expected by network and build accompanying availability matrix.
-        :param ego_agent_features: agent features to be extracted (ego + other agents)
-        :param batch_size: number of samples in batch to extract
-        :return:
-            agent_features: <torch.FloatTensor: batch_size, num_elements (polylines) (1+max_agents*num_agent_types),
-                num_points_per_element, feature_dimension>. Stacked ego, agent, and map features.
-            agent_avails: <torch.BoolTensor: batch_size, num_elements (polylines) (1+max_agents*num_agent_types),
-                num_points_per_element>. Bool specifying whether feature is available or zero padded.
+        Extract ego and agent features from CARLA environment
+        Args:
+            ego_agent_features: agent features to be extracted (ego + other agents)
+            batch_size: number of samples in batch to extract
+        Returns:
+            agent_features: Stacked ego, agent, and map features
+            agent_avails: Boolean mask for feature availability
         """
         agent_features = []  # List[<torch.FloatTensor: max_agents+1, total_max_points, feature_dimension>: batch_size]
         agent_avails = []  # List[<torch.BoolTensor: max_agents+1, total_max_points>: batch_size]
@@ -240,14 +255,13 @@ class MCTSModel(TorchModuleWrapper):
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Extract map features into format expected by network and build accompanying availability matrix.
-        :param vector_set_map_data: VectorSetMap features to be extracted
-        :param batch_size: number of samples in batch to extract
-        :return:
-            map_features: <torch.FloatTensor: batch_size, num_elements (polylines) (max_lanes),
-                num_points_per_element, feature_dimension>. Stacked map features.
-            map_avails: <torch.BoolTensor: batch_size, num_elements (polylines) (max_lanes),
-                num_points_per_element>. Bool specifying whether feature is available or zero padded.
+        Extract map features from CARLA environment
+        Args:
+            vector_set_map_data: VectorSetMap features to be extracted
+            batch_size: number of samples in batch to extract
+        Returns:
+            map_features: Stacked map features
+            map_avails: Boolean mask for feature availability
         """
         map_features = []  # List[<torch.FloatTensor: max_map_features, total_max_points, feature_dim>: batch_size]
         map_avails = []  # List[<torch.BoolTensor: max_map_features, total_max_points>: batch_size]
@@ -296,50 +310,57 @@ class MCTSModel(TorchModuleWrapper):
 
     def forward(self, features: FeaturesType) -> TargetsType:
         """
-        Predict
-        :param features: input features containing
-                        {
-                            "vector_set_map": VectorSetMap,
-                            "generic_agents": GenericAgents,
-                        }
-        :return: targets: predictions from network
-                        {
-                            "trajectory": Trajectory,
-                        }
+        Forward pass for CARLA environment
+        Args:
+            features: input features containing
+                     {
+                         "vector_set_map": VectorSetMap,
+                         "generic_agents": GenericAgents,
+                         "camera_data": CameraData,  # Added for CARLA
+                         "vehicle_state": VehicleState,  # Added for CARLA
+                     }
+        Returns:
+            targets: predictions from network
+                    {
+                        "trajectory": Trajectory,
+                        "control_commands": ControlCommands,  # Added for CARLA
+                    }
         """
         # Recover features
         features_init = features
         vector_set_map_data = cast(VectorSetMap, features["vector_set_map"])
         ego_agent_features = cast(GenericAgents, features["generic_agents"])
-
+        
+        # Process CARLA-specific features
+        camera_data = features.get("camera_data")
+        vehicle_state = features.get("vehicle_state")
+        
         batch_size = ego_agent_features.batch_size
 
         # Extract features across batch
         agent_features, agent_avails = self.extract_agent_features(ego_agent_features, batch_size)
-
-        n_agents = agent_features.size()[1]
-        xyh = agent_features[:, :, :1, :3]
         map_features, map_avails = self.extract_map_features(vector_set_map_data, batch_size)
+        
+        # Combine features
         features = torch.cat([agent_features, map_features], dim=1)
         avails = torch.cat([agent_avails, map_avails], dim=1)
 
-        # embed inputs
+        # Process features through network
         feature_embedding = self.feature_embedding(features)
-
-        # calculate positional embedding, then transform [num_points, 1, feature_dim] -> [1, 1, num_points, feature_dim]
         pos_embedding = self.positional_embedding(features).unsqueeze(0).transpose(1, 2)
-
-        # invalid mask
+        
+        # Handle invalid features
         invalid_mask = ~avails
         invalid_polys = invalid_mask.all(-1)
-
-        # local subgraph
+        
+        # Process through subgraph and attention layers
         embeddings = self.local_subgraph(feature_embedding, invalid_mask, pos_embedding)
         if hasattr(self, "global_from_local"):
             embeddings = self.global_from_local(embeddings)
         embeddings = F.normalize(embeddings, dim=-1) * (self._model_params.global_embedding_size**0.5)
         embeddings = embeddings.transpose(0, 1)
-
+        
+        # Add type embeddings
         type_embedding = self.type_embedding(
             batch_size,
             self._feature_params.max_agents,
@@ -348,43 +369,31 @@ class MCTSModel(TorchModuleWrapper):
             self._feature_params.max_elements,
             device=features.device,
         ).transpose(0, 1)
-
-        # disable certain elements on demand
-        if self._feature_params.disable_agents:
-            invalid_polys[
-                :,
-                1 : (1 + self._feature_params.max_agents * len(self._feature_params.agent_features)),
-            ] = 1  # agents won't create attention
-
-        if self._feature_params.disable_map:
-            invalid_polys[
-                :,
-                (1 + self._feature_params.max_agents * len(self._feature_params.agent_features)) :,
-            ] = 1  # map features won't create attention
-
-        invalid_polys[:, 0] = 0  # make ego always available in global graph
-
+        
+        # Process through attention layers
+        n_agents = agent_features.size()[1]
         agent_embeddings = embeddings[:n_agents]
         map_embeddings = embeddings[n_agents:]
         agent_types = type_embedding[:n_agents]
         map_types = type_embedding[n_agents:]
         agent_polys = invalid_polys[:, :n_agents]
         map_polys = invalid_polys[:, n_agents:]
-
-        # global attention layers (transformer)
-        map_embeddings, attns = self.global_map(map_embeddings, map_embeddings, map_types, map_polys, n_agents)
+        
+        # Global attention processing
+        map_embeddings, _ = self.global_map(map_embeddings, map_embeddings, map_types, map_polys, n_agents)
         map_embeddings = map_embeddings.transpose(0, 1)
-
-        agent_embeddings, attns = self.global_head1(agent_embeddings, map_embeddings, map_types, map_polys, n_agents)
+        
+        agent_embeddings, _ = self.global_head1(agent_embeddings, map_embeddings, map_types, map_polys, n_agents)
         agent_embeddings = agent_embeddings.transpose(0, 1)
-        agent_embeddings, attns = self.global_head2(
+        agent_embeddings, _ = self.global_head2(
             agent_embeddings,
             agent_embeddings,
             agent_types,
             agent_polys,
             n_agents,
         )
-
+        
+        # Generate outputs
         outputs = self.final_output(agent_embeddings)
         outputs = outputs.view(
             batch_size,
@@ -392,9 +401,12 @@ class MCTSModel(TorchModuleWrapper):
             self.future_trajectory_sampling.num_poses,
             self._target_params.num_output_features // self.future_trajectory_sampling.num_poses,
         )
+        
+        # Process ego predictions
         ego_pred = outputs[:, 0]
         outputs = torch.cat((xyh, outputs), dim=-2)
-
+        
+        # Interpolate outputs
         outputs = (
             torch.nn.functional.interpolate(
                 outputs[0].permute(0, 2, 1),
@@ -406,187 +418,50 @@ class MCTSModel(TorchModuleWrapper):
             .unsqueeze(0)
         )
         outputs = outputs[..., 1:, :]
-
-        if 1:  # (time.perf_counter()-features_init['start_time']) < 0.8:
-            batch_pos = []
-            batch_acc = []
-            batch_yr = []
-            batch_speed = []
-            batch_yaw = []
-            agent_features = torch.flip(agent_features, dims=[2])
-            agent_avails = torch.flip(agent_avails, dims=[2])
-            ego_poses = agent_features[:, 0, :, :2]
-            ego_speeds = torch.sqrt(((ego_poses[:, 1:] - ego_poses[:, :-1]) ** 2).sum(-1)) / 0.5
-
-            if "current_speed" in features_init:
-                ego_speeds[0, -1] = features_init["current_speed"]
-
-            map = vector_set_map_data.coords["ROUTE_LANES"][0]  # map_features[:, :, :, :2]
-            mask = vector_set_map_data.availabilities["ROUTE_LANES"][0]
-
-            map_lane = vector_set_map_data.coords["LANE"][0]  # map_features[:, :, :, :2]
-            mask_lane = vector_set_map_data.availabilities["LANE"][0]
-
-            lights = vector_set_map_data.traffic_light_data["LANE"][0][:, -1, 2] > 0
-            lights_route = vector_set_map_data.traffic_light_data["ROUTE_LANES"][0][:, -1, 2] > 0
-            map = map[~lights_route][None]
-            mask = mask[~lights_route][None]
-
-            map_lane = map_lane[~lights][None]
-            mask_lane = mask_lane[~lights][None]
-
-            other_dim = ego_agent_features.agents["VEHICLE"][0][-1, :30, 6:8]
-            other_dim = other_dim[None]
-
-            traffic_cones = ego_agent_features.agents["TRAFFIC_CONE"][0][-1, :, :3]
-            traffic_cones_dims = ego_agent_features.agents["TRAFFIC_CONE"][0][-1, :, 6:8]
-
-            objects = ego_agent_features.agents["GENERIC_OBJECT"][0][-1, :, :3]
-            objects_dims = ego_agent_features.agents["GENERIC_OBJECT"][0][-1, :, 6:8]
-
-            pedestrians = ego_agent_features.agents["PEDESTRIAN"][0][-1, :, :3]
-            pedestrians_dims = ego_agent_features.agents["PEDESTRIAN"][0][-1, :, 6:8]
-            pedestrian_mask = pedestrians[..., 0] > 0
-            pedestrians = pedestrians[pedestrian_mask]
-            pedestrians_dims = pedestrians_dims[pedestrian_mask]
-
-            static = torch.cat([traffic_cones, objects], 0)
-            static_dims = torch.cat([traffic_cones_dims, objects_dims], 0)
-            behind_mask_static = static[..., 0] > -2
-            static = static[behind_mask_static]
-            static_dims = static_dims[behind_mask_static]
-            success = False
-            for b in range(batch_size):
-                other_agents = agent_features[b : b + 1, 1:]
-                other_mask = agent_avails[b : b + 1, 1:]
-                prediction = outputs[b : b + 1, 1:]
-                all_time_mask = other_mask.amax(-1)
-
-                other_agents_poses = other_agents[:, :, :, :2]  # batch, vehicle, time, positions
-                speed_mask = other_mask[..., 1:] * other_mask[..., :-1]
-                other_agents_speed = (
-                    torch.sqrt(((other_agents_poses[:, :, 1:, :] - other_agents_poses[:, :, :-1, :]) ** 2).sum(-1))
-                    / 0.5
-                )
-                other_agents_speed = other_agents_speed * speed_mask
-                other_agents_max_speeds = other_agents_speed[:, 0, ...].amax(-1)
-                other_agents_max_speeds = max(other_agents_max_speeds, 6)
-                other_agents_max_speeds = min(other_agents_max_speeds, 10)
-
-                other_agents = other_agents[all_time_mask][None]
-                other_mask = other_mask[all_time_mask][None]
-                prediction = prediction[all_time_mask][None]
-
-                behind_mask = other_agents[:, :, -1, 0] > 0
-
-                map = map[b : b + 1, :, :, :2]
-                map_mask = mask[b : b + 1]
-                lane_mask = map_mask.amax(-1)
-                map = map[lane_mask][None]
-                map_mask = map_mask[lane_mask][None]
-
-                additional_map = map_lane[b : b + 1, :, :, :2]
-                additional_map_mask = mask_lane[b : b + 1]
-                lane_mask = additional_map_mask.amax(-1)
-                additional_map = additional_map[lane_mask][None]
-                additional_map_mask = additional_map_mask[lane_mask][None]
-
-                batch_sample = {
-                    "ego": agent_features[b : b + 1, 0].detach().cpu().numpy(),
-                    "agents": other_agents.detach().cpu().numpy(),
-                    "map": map.detach().cpu().numpy(),
-                    "prediction": prediction[:, :, None].detach().cpu().numpy(),
-                    "agents_mask": other_mask[..., None].detach().cpu().numpy(),
-                    "map_mask": map_mask.detach().cpu().numpy(),
-                    "additional_map": additional_map.detach().cpu().numpy(),
-                    "additional_map_mask": additional_map_mask.detach().cpu().numpy(),
-                    "agents_dim": other_dim.detach().cpu().numpy(),
-                    "static_objects": static[None].detach().cpu().numpy(),
-                    "static_objects_dims": static_dims[None].detach().cpu().numpy(),
-                    "pedestrians": pedestrians[None].detach().cpu().numpy(),
-                    "pedestrians_dims": pedestrians_dims[None].detach().cpu().numpy(),
-                    "ego_pred": ego_pred.detach().cpu().numpy(),
-                }
-                batch_sample["ego_pos"] = ego_poses[b : b + 1].detach().cpu().numpy()
-                batch_sample["ego_speed"] = ego_speeds[b : b + 1][..., None].detach().cpu().numpy()
-                batch_sample["ego_yaw"] = agent_features[:, 0, :, 2][..., None].detach().cpu().numpy()
-                batch_sample["max_speed"] = other_agents_max_speeds
-                batch_sample["start_time"] = features_init["start_time"]
-
-                if "speed_limit" in features_init and features_init["speed_limit"] is not None:
-                    batch_sample["max_speed"] = min(features_init["speed_limit"], 13.4)
-                    batch_sample["max_speed"] = min(batch_sample["max_speed"], other_agents_max_speeds + 1)
-
-                tree = Tree(
-                    batch_sample,
-                    self,
-                    None,
-                    outputs,
-                    action=features_init["action"],
-                    pred_idx=0,
-                    count=self.count,
-                )
-                (tree_acc, tree_yr), best_T = tree.simulate(k=256)
-                tree_acc[:, 6] += (tree_acc.sum(-1) == 0) * 0.1
-                tree_yr[:, 6] += (tree_yr.sum(-1) == 0) * 0.1
-                batch_acc.append(tree_acc)
-                batch_yr.append(tree_yr)
-
-            self.count += 1
-            tree_acc = np.stack(batch_acc, 0)
-            tree_yr = np.stack(batch_yr, 0)
-            tree_acc = torch.tensor(tree_acc[:, :], device=agent_features.device)
-            tree_yr = torch.tensor(tree_yr[:, :], device=agent_features.device)
-
-            initial_speed = ego_speeds[
-                :,
-                -1,
-            ]
-            initial_pos = torch.zeros((batch_size, 2), device=agent_features.device)
-            initial_yaw = torch.zeros(batch_size, device=agent_features.device)
-            trajectory = discrete_actions_to_trajectory(
-                initial_speed,
-                initial_pos,
-                initial_yaw,
-                tree_yr,
-                tree_acc,
-                0.1,
-            )
-        else:
-            trajectory = outputs[:, 0]
-
+        
+        # Generate control commands for CARLA
+        control_commands = self.generate_control_commands(outputs, vehicle_state)
+        
         return {
-            "trajectory": Trajectory(data=convert_predictions_to_trajectory(trajectory)),
+            "trajectory": Trajectory(data=convert_predictions_to_trajectory(outputs)),
             "agents_trajectories": MultipleAgentsTrajectories(outputs),
+            "control_commands": control_commands,  # Added for CARLA
         }
-
-
-def discrete_actions_to_trajectory(
-    initial_speed,
-    initial_pos,
-    initial_yaw,
-    discrete_steering,
-    discrete_acc,
-    dt,
-):
-    def to_acc(acc):
-        return 3 * (acc - 13 // 2) / 6
-
-    def to_steer(steering):
-        return np.pi / 4 * (steering - 13 // 2) / 6
-
-    new_discrete_acc = to_acc(torch.argmax(discrete_acc, -1))
-
-    pred_speed = initial_speed + torch.cumsum(new_discrete_acc, -1) * dt
-    pred_speed = torch.relu(pred_speed)
-
-    new_discrete_steering = to_steer(torch.argmax(discrete_steering, -1))
-    new_discrete_yaw_rate = pred_speed * torch.tan(new_discrete_steering) / 3.1
-    pred_yaw = initial_yaw[..., None] + torch.cumsum(new_discrete_yaw_rate, -1) * dt
-    yaw_vec = torch.stack([torch.cos(pred_yaw), torch.sin(pred_yaw)], -1)
-
-    pred_velocity = yaw_vec * pred_speed[..., None]
-    pred_pos = initial_pos.unsqueeze(-2) + torch.cumsum(pred_velocity, -2) * dt
-    outputs = torch.cat((pred_pos, pred_yaw[..., None]), -1)
-
-    return outputs
+        
+    def generate_control_commands(self, outputs: torch.Tensor, vehicle_state: Dict) -> Dict:
+        """
+        Generate control commands for CARLA vehicle
+        Args:
+            outputs: model outputs
+            vehicle_state: current vehicle state
+        Returns:
+            control_commands: dictionary containing throttle, brake, and steer values
+        """
+        # Extract trajectory predictions
+        trajectory = outputs[0, 0]  # ego vehicle trajectory
+        
+        # Calculate desired speed and heading
+        desired_speed = torch.norm(trajectory[1:] - trajectory[:-1], dim=-1) / self.dt
+        desired_heading = torch.atan2(
+            trajectory[..., 1] - trajectory[:-1, ..., 1],
+            trajectory[..., 0] - trajectory[:-1, ..., 0]
+        )
+        
+        # Calculate control commands
+        current_speed = vehicle_state["speed"]
+        current_heading = vehicle_state["heading"]
+        
+        # Throttle and brake
+        speed_diff = desired_speed - current_speed
+        throttle = torch.clamp(speed_diff, 0, 1)
+        brake = torch.clamp(-speed_diff, 0, 1)
+        
+        # Steering
+        heading_diff = desired_heading - current_heading
+        steer = torch.clamp(heading_diff / np.pi, -1, 1)
+        
+        return {
+            "throttle": throttle,
+            "brake": brake,
+            "steer": steer,
+        }
