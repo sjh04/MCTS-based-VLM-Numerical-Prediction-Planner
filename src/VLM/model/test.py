@@ -28,6 +28,7 @@ processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
 image_path = "/home/ubuntu/sjh04/MCTS-based-VLM-Numerical-Prediction-Planner/src/VLM/model/A.png"
 image = Image.open(image_path)
 question = "What is in the image?"
+letter = "A"
 
 # 按照正确的格式组织消息
 messages = [

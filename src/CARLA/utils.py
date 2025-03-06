@@ -125,3 +125,13 @@ def create_camera_description(camera_images):
     
     return description
 
+def get_vehicle_state(vehicle):
+    """
+    Get the vehicle state
+    """
+    state = {
+        "speed": vehicle.get_velocity(),
+        "steering": vehicle.get_control().steer,
+        "lane": vehicle.get_location().lane_id
+    }
+    return state

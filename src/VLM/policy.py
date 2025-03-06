@@ -1,122 +1,88 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from typing import Dict, List, Union, Tuple
 import numpy as np
 from PIL import Image
-from .process_image import process_camera_images
+from .utils import *
+from qwen_vl_utils import process_vision_info
+
 
 class HighLevelPolicyGenerator:
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-3B"):
+    def __init__(self, state: Dict, image: dict, history: List[str], navigation_info: str, model_name: str = "Qwen/Qwen2.5-VL-3B"):
         """
         Initialize the policy generator
         Args:
+            state: Dict
+            image: dict
+            history: List[str]
             model_name: Qwen2.5-VL-3B model name
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            trust_remote_code=True
-        ).eval()
-        
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_name, torch_dtype="auto", device_map="auto"
+        )
+        self.processor = AutoProcessor.from_pretrained(model_name)
+
+        self.image = image
+        self.history = history
+        self.state = state
         self.action_space = ["overtaking", "keeping lane", "turning left", "turning right", 
                            "left change", "right change", "brake"]
-        self.action_to_id = {action: i for i, action in enumerate(self.action_space)}
-        self.id_to_action = {i: action for i, action in enumerate(self.action_space)}
-    
-    def generate_single_action_id(self, camera_images: Dict[str, Image.Image], 
-                             current_state: Dict,
-                             history: List[str]) -> int:
+        self.messages = None
+        self.navigation_info = navigation_info
+        
+    def generate_policy_id(self):
         """
-        Generate the most likely action based on the current state and history
-        Args:
-            camera_images: dictionary of camera images
-            current_state: current vehicle state
-            history: list of previous actions
-        Returns:
-            action id
+        Generate the policy
         """
-        # build the state description
-        state_description = self._build_state_description(current_state, history)
-        
-        # process the image input
-        model_input = process_camera_images(camera_images, state_description)
-        
-        # build the prompt
-        prompt = self._build_single_action_prompt(model_input['text'])
-        
-        # generate the model output
-        with torch.no_grad():
-            # Prepare text input
-            text_inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-            
-            # Prepare image input
-            image_inputs = []
-            for image in model_input['images']:
-                image_input = self.model.processor(images=image, return_tensors="pt").to(self.device)
-                image_inputs.append(image_input)
-            
-            # Combine text and image inputs
-            inputs = {
-                **text_inputs,
-                'images': image_inputs
-            }
-            
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=128,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True
-            )
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # parse the model output to get the most likely action
-        action = self._parse_single_action_output(response)
-        print(f"Action: {action}")
+        # build messages
+        state_description = build_state_description(self.state)
+        history_description = build_history_description(self.history)
+        prompt = build_macro_action_prompt(state_description, history_description, self.action_space, self.navigation_info)
+        self.messages = build_messages(self.image, prompt)
 
-        return self.action_to_id[action]
+        # generate action
+        text = self.processor.apply_chat_template(
+            self.messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(self.messages)
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt"
+        ).to(self.device)
+        generated_ids = self.model.generate(**inputs, max_new_tokens=128)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
 
-    def _build_state_description(self, current_state: Dict, history: List[str]) -> str:
-        """
-        Build the state description
-        """
-        desc = f"Current vehicle state:\n"
-        desc += f"Speed: {current_state.get('speed', 0)} km/h\n"
-        desc += f"Lane: {current_state.get('lane', 'unknown')}\n"
-        desc += f"Action history: {', '.join(history)}\n"
-        return desc
-    
-    
-    def _build_single_action_prompt(self, state_text: str) -> str:
-        """
-        Build the model prompt for single action generation
-        """
-        prompt = f"""Based on the following vehicle state and camera images, 
-        please analyze the situation and provide the most appropriate action.
-        Consider safety, efficiency, and traffic rules.
+        # parse action from response
+        action = parse_action(output_text)
+        reasoning = parse_reasoning(output_text)
+        print(f"Reasoning: {reasoning}")
+        print(f"Generated action: {action}")
         
-        {state_text}
-        
-        Please provide your analysis in the following format:
-        Most appropriate action: [action]
-        """
-        return prompt
-    
-    
-    def _parse_single_action_output(self, response: str) -> str:
-        """
-        Parse the model output to get the most likely action
-        """
-        action = None
+        # transform action to id
+        action_id = action_to_id(action, self.action_space)
+        return action_id
 
-        # parse the action
-        action_line = response.split("Most appropriate action:")[1]
-        action = action_line.strip().strip("[]")
-        
-        return action
 
+def refinement_policy_id(macro_action: str, state: Dict, image: dict, history: List[str]):
+    """
+    Refine the policy id
+    """
+    # build messages
+    state_description = build_state_description(state)
+    history_description = build_history_description(history)
+    prompt = build_mid_action_prompt(state_description, history_description, macro_action)
+    messages = build_messages(image, prompt)
+    
+    pass
 
 class LowLevelPolicyGenerator:
     def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-3B"):
