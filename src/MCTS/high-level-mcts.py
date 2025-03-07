@@ -1,4 +1,8 @@
+import numpy as np
+import os
+from ..VLM.policy import HighLevelPolicyGenerator
 
+DISCOUNT_FACTOR = 0.95
 
 class ActionNode:
     """
@@ -9,7 +13,7 @@ class ActionNode:
     value: float
     visits: int
     """
-    def __init__(self, action: string):
+    def __init__(self, action: str):
         self.action = action
         self.children = []
         self.parent = None
@@ -74,30 +78,130 @@ class MCTSAgent:
         self.DISCOUNT_FACTOR = 0.95
         self.MAX_DEPTH = 3
         self.MAX_ROLLOUTS = 10
-        
+        self.C_PUCT = 1.0  # PUCT exploration constant
+        self.vlm_policy = HighLevelPolicyGenerator()
 
-    def rollout(self, state_node: StateNode):
+    def select(self, state_node: StateNode):
         """
-        Rollout the state node.
+        using PUCT to select the best action node
         """
-        pass
+        if not state_node.children:
+            return None
+        
+        puct_scores = []
+        for action_node in state_node.children:
+            # PUCT: Q(s,a) + C_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
+            q_value = action_node.value / (action_node.visits + 1)
+            prior_prob = state_node.children_probs[state_node.children.index(action_node)]
+            exploration = self.C_PUCT * prior_prob * np.sqrt(state_node.N) / (1 + action_node.visits)
+            puct_score = q_value + exploration
+            puct_scores.append(puct_score)
+        
+        best_action_node = state_node.children[np.argmax(puct_scores)]
+        return best_action_node
 
     def expand(self, state_node: StateNode):
         """
-        Expand the state node.
+        expand the state node, using VLM to generate the action probability
         """
-        pass
+        if state_node.done:
+            return
+        
+        # using VLM to generate the action probability
+        action_probs = self.vlm_policy.generate_policy_id()
+        
+        # create the action node for each valid action
+        for action, prob in zip(self.action_space, action_probs):
+            action_node = ActionNode(action)
+            action_node.parent = state_node
+            state_node.children.append(action_node)
+            state_node.children_probs.append(prob)
 
-    def backpropagate(self, state_node: StateNode):
+    def rollout(self, state_node: StateNode):
         """
-        Backpropagate the state node.
+        using VLM to do the Monte Carlo simulation
         """
-        pass
-    
-    def select(self, state_node: StateNode):
+        current_state = state_node
+        cumulative_reward = 0
+        depth = 0
+        
+        while not current_state.done and depth < self.MAX_DEPTH:
+            # using VLM to select the action
+            action_id = self.vlm_policy.generate_policy_id()
+            # simulate the action, get the next state and reward
+            next_state = self.simulate_action(current_state, action_id)
+            reward = self.get_reward(next_state)
+            
+            cumulative_reward += (self.DISCOUNT_FACTOR ** depth) * reward
+            current_state = next_state
+            depth += 1
+        
+        return cumulative_reward
+
+    def backpropagate(self, state_node: StateNode, value: float):
         """
-        Select the best action node from the state node.
+        backpropagation to update the value and visits of the node
         """
-        pass
+        current = state_node
+        while current is not None:
+            current.N += 1
+            if current.parent is not None:
+                parent_action = current.parent.children[current.parent_action_id]
+                parent_action.visits += 1
+                parent_action.value += value
+            current = current.parent
+
+    def simulate_action(self, state_node: StateNode, action_id: int):
+        """
+        simulate the action, return the next state node
+        """
+        # need to be implemented
+        new_state = StateNode()
+        # set the attributes of the new state
+        new_state.parent = state_node
+        new_state.parent_action_id = action_id
+        return new_state
+
+    def get_reward(self, state_node: StateNode):
+        """
+        calculate the reward of the state
+        """
+        # need to be implemented
+        return state_node.reward
+
+    def search(self, root_state: StateNode, num_simulations: int):
+        """
+        execute the MCTS search
+        """
+        self.root = root_state
+        
+        for _ in range(num_simulations):
+            current = self.root
+            # Selection
+            while current.children and not current.done:
+                action_node = self.select(current)
+                if not action_node.children:
+                    break
+                current = action_node.children[0]
+            
+            # Expansion
+            if not current.done:
+                self.expand(current)
+            
+            # Rollout
+            value = self.rollout(current)
+            
+            # Backpropagation
+            self.backpropagate(current, value)
+        
+        # return the action with the most visits
+        return self.get_best_action()
+
+    def get_best_action(self):
+        """
+        return the best action
+        """
+        visits = [child.visits for child in self.root.children]
+        return self.action_space[np.argmax(visits)]
     
     

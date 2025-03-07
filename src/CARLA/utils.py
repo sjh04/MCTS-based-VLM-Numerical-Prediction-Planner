@@ -135,3 +135,10 @@ def get_vehicle_state(vehicle):
         "lane": vehicle.get_location().lane_id
     }
     return state
+
+def get_navigation_instructions(vehicle):
+    """
+    Get the navigation instructions
+    """
+    pass
+
