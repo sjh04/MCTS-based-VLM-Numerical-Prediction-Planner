@@ -14,40 +14,11 @@ class Belief():
             np.random.seed(seed)
 
         # Possible beliefs for some objects
-        self.container_restrictions = {
-                'book': ['cabinet', 'kitchencabinet']
-        }
-
-        self.id_restrictions_inside = {
-
-        }
 
         self.debug = False
 
         self.high_prob = 1e5
         self.low_prob = 1e-5
-        self.name_equivalence = load_name_equivalence()
-        self.map_properties_to_pred = {
-            'ON': ('on', True),
-            'OPEN': ('open', True),
-            'OFF': ('on', False),
-            'CLOSED': ('open', False)
-        }
-        
-        self.map_edges_to_pred = {
-            'INSIDE': 'inside',
-            'CLOSE': 'close',
-            'ON': 'ontop',
-            'FACING': 'facing'
-        }
-        self.house_obj = [
-                'floor',
-                'wall',
-                'ceiling'
-        ]
-
-        self.class_nodes_delete = ['wall', 'floor', 'ceiling', 'curtain', 'window']
-        self.categories_delete = ['Doors']
 
         self.agent_id = agent_id
         self.grabbed_object = []
@@ -68,8 +39,6 @@ class Belief():
         self.sampled_graph = new_graph
         
 
-        self.states_consider = ['OFF', 'CLOSED']
-        self.edges_consider = ['INSIDE', 'ON']
         self.node_to_state_belief = {}
         self.room_node = {}
         self.room_nodes = []
@@ -121,13 +90,6 @@ class Belief():
 
         for node in self.room_node:
             self.room_node[node][1] = self.update(self.room_node[node][1], self.first_room[node][1])
-
-
-    def _remove_house_obj(self, state):
-        delete_ids = [x['id'] for x in state['nodes'] if x['class_name'].lower() in self.class_nodes_delete]
-        state['nodes'] = [x for x in state['nodes'] if x['id'] not in delete_ids]
-        state['edges'] = [x for x in state['edges'] if x['from_id'] not in delete_ids and x['to_id'] not in delete_ids]
-        return state
     
     def init_belief_commonsense(self):
         # set belief on object states acording to commonsense
@@ -141,31 +103,6 @@ class Belief():
                 belief_dict[bin_var.positive] = 0.0
 
             self.node_to_state_belief[node['id']] = belief_dict
-
-        # TODO: ths class should simply have a surface property
-        container_classes = [
-        'bathroomcabinet',
-        'kitchencabinet',
-        'cabinet',
-        'fridge',
-        'stove',
-        # 'kitchencounterdrawer',
-        'dishwasher',
-        'microwave']
-
-        surface_classes = ["bed",
-                         "bookshelf",
-                         "cabinet",
-                         "coffeetable",
-                         "cuttingboard",
-                         "floor",
-                         "fryingpan",
-                         "kitchencounter",
-                         "kitchentable",
-                         "nightstand",
-                         "bathroomcounter",
-                         "sofa",
-                         "stove"]           
 
 
         # Solve these cases
@@ -494,18 +431,7 @@ class Belief():
                 # print(node)
         return self.sampled_graph
 
-    def to_vh_state(self, graph):
-        state = self._remove_house_obj(graph)
-        vh_state = EnvironmentState(EnvironmentGraph(state), 
-                                    self.name_equivalence, instance_selection=True)
-        return vh_state
-
-    def canopen_and_open(self, node):
-        return 'CAN_OPEN' in node['properties'] and 'OPEN' in node['states']
-
-    def is_surface(self, node):
-        return 'SURFACE' in node['properties']
-
+    
     def update_graph_from_gt_graph(self, gt_graph):
         """
         Updates the current sampled graph with a set of observations
