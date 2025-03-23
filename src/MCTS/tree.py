@@ -6,8 +6,8 @@ import numpy as np
 import carla
 from typing import Dict, List, Tuple, Optional
 
-from nuplan.planning.training.modeling.models.np_mcts_bicycle_node import Node
-from nuplan.planning.training.modeling.models.np_mcts_bicycle_utils import (
+from .node import Node
+from .utils import (
     check_drivable_area,
     check_ego_collisions_idx,
     get_directional_values,

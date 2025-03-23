@@ -3,11 +3,11 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 import numpy as np
 import carla
 
-from nuplan.planning.training.modeling.models.np_mcts_bicycle_utils import check_drivable_area, check_ego_collisions
+from .utils import check_drivable_area, check_ego_collisions
 
 
 if TYPE_CHECKING:
-    from nuplan.planning.training.modeling.models.np_mcts_bicycle_tree import Tree
+    from .tree import Tree
 
 
 class Node:
@@ -126,24 +126,24 @@ class Node:
             not_drivable: whether not drivable
         """
         if self.n == 0:
-            # 获取预测轨迹
+            # get past actions
             predict_traj = self.state["trajectory"]
             predict_yaw = self.state["yaw"]
             
-            # 检查碰撞
+            # check for collisions
             collision = self.check_collision(predict_traj, predict_yaw)
             
-            # 检查是否在可行驶区域内
+            # check for drivable area
             drivable = self.check_drivable_area(predict_traj, predict_yaw)
             
-            # 计算进度
+            # calculate progress
             progress = min(self.speed / self.tree.max_speed, 1)
             
-            # 计算分数
+            # calculate score
             score = (
-                -5 * collision  # 碰撞惩罚
-                + drivable * 0.5  # 可行驶奖励
-                + progress * (not collision) * drivable  # 进度奖励
+                -5 * collision  # collision penalty
+                + drivable * 0.5  # drivable reward
+                + progress * (not collision) * drivable  # progress reward
             )
             
             self.value = score
@@ -160,10 +160,10 @@ class Node:
         Returns:
             bool: whether collision occurred
         """
-        # 获取周围车辆信息
+        # get all vehicles
         vehicles = self.tree.world.get_actors().filter('vehicle.*')
         
-        # 检查与每个车辆的碰撞
+        # check for ego vehicle collisions
         for vehicle in vehicles:
             if vehicle.id != self.tree.ego_vehicle.id:
                 if self.check_vehicle_collision(trajectory, yaw, vehicle):

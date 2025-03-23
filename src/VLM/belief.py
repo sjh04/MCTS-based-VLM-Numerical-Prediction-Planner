@@ -21,48 +21,14 @@ class Belief():
         self.low_prob = 1e-5
 
         self.agent_id = agent_id
-        self.grabbed_object = []
-
-
-
-        self.graph_helper = vh_utils.graph_dict_helper()
-        self.binary_variables = self.graph_helper.binary_variables
-
-        self.prohibit_ids = [node['id'] for node in graph_gt['nodes'] if node['class_name'].lower() in self.class_nodes_delete or 
-                             node['category'] in self.categories_delete]
-        new_graph = {
-            'nodes': [copy.deepcopy(node) for node in graph_gt['nodes'] if node['id'] not in self.prohibit_ids],
-            'edges': [edge for edge in graph_gt['edges'] if edge['to_id'] not in self.prohibit_ids and edge['from_id'] not in self.prohibit_ids]
-        }
-        self.graph_init = graph_gt
-        # ipdb.set_trace()
-        self.sampled_graph = new_graph
         
 
         self.node_to_state_belief = {}
-        self.room_node = {}
-        self.room_nodes = []
-        self.container_ids = []
-        self.surface_ids = []
-
-        # Binary Variable Dict
-        self.bin_var_dict = {}
-        for bin_var in self.binary_variables:
-            self.bin_var_dict[bin_var.negative] = [[bin_var.positive, bin_var.negative], 0]
-            self.bin_var_dict[bin_var.positive] = [[bin_var.positive, bin_var.negative], 1]
+        self.ego_id = {}
 
         id2node = {}
         for x in graph_gt['nodes']:
             id2node[x['id']] = x
-
-        # Door edges: Will be used to make the graph walkable
-        self.door_edges = {}
-        for edge in self.graph_init['edges']:
-            if edge['relation_type'] == 'BETWEEN':
-                if id2node[edge['from_id']]['category'] == 'Doors':
-                    if edge['from_id'] not in self.door_edges.keys():
-                        self.door_edges[edge['from_id']] = []
-                    self.door_edges[edge['from_id']].append(edge['to_id'])
 
         # Assume that between 2 nodes there is only one edge
         self.edge_belief = {}
@@ -85,11 +51,7 @@ class Belief():
     #         belief_node[1] = prior
 
     def update_to_prior(self):
-        for node_name in self.edge_belief:
-            self.edge_belief[node_name]['INSIDE'][1] = self.update(self.edge_belief[node_name]['INSIDE'][1], self.first_belief[node_name]['INSIDE'][1])
-
-        for node in self.room_node:
-            self.room_node[node][1] = self.update(self.room_node[node][1], self.first_room[node][1])
+        pass
     
     def init_belief_commonsense(self):
         # set belief on object states acording to commonsense
