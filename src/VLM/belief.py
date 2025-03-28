@@ -5,7 +5,82 @@ import pdb
 import sys
 import json
 import copy
+from .policy import VehicleBelief
+from .utils import *
 
+class OtherVehicleAgent:
+    def __init__(self, states, agent_ids):
+        """
+        Initialize the agent
+        """
+        self.agent_ids = agent_ids # agent id list
+        self.current_states = states # {agent_id: state}, state is a dict, {lane: int, speed: int}
+        self.action_probs = {} # {agent_id: action}, action is a array, [overtaking, keeping lane, turning left, turning right, left change, right change, brake]
+        self.transition_state = None
+        self.action_space = ["overtaking", "keeping lane", "turning left", "turning right", 
+                           "left change", "right change", "brake"]
+        self.generate_belifs = VehicleBelief()
+
+    def get_action(self):
+        """
+        Get the action
+        """
+        json_path = self.generate_belifs.generate_belief(self.current_states, self.agent_ids)
+        """
+        [
+            {"vehicle_id": 1, "action": "overtaking"},
+            {"vehicle_id": 2, "action": "keeping lane"},
+            {"vehicle_id": 3, "action": "turning left"},
+            {"vehicle_id": 4, "action": "turning right"},
+            {"vehicle_id": 5, "action": "left change"},
+            {"vehicle_id": 6, "action": "right change"},
+            {"vehicle_id": 7, "action": "brake"}
+        ]
+        """
+
+        with open(json_path) as f:
+            for line in f:
+                data = json.loads(line)
+                vehicle_id = data["vehicle_id"]
+                if vehicle_id in self.agent_ids:
+                    action = data["action"]
+                    action_prob = self._calculate_probability(vehicle_id, action)
+                    self.action_probs[vehicle_id] = action_prob
+                
+
+
+    def transition(self):
+        """
+        Transition the agent
+        """
+
+        self.current_state = self.transition_state
+
+    def _calculate_probability(self, agent_id, action, trust_level=1.0, aggression=0.1):
+        """
+        Calculate the probability
+        """
+        base_probabilities = np.ones(len(self.action_space)) * (trust_level / 2)
+        action_id = action_to_id(action, self.action_space)
+
+        base_probabilities[action_id] = 1.0
+         # Apply domain rules to modify probabilities
+        safety_mask = np.ones(len(self.action_space))
+        
+        if self.current_state[agent_id]['speed'] > 100:  # High speed
+            # Reduce probability of sharp turns
+            turn_indices = [i for i, a in enumerate(self.action_space) if 'turn' in a]
+            for idx in turn_indices:
+                safety_mask[idx] = aggression
+        
+        # Apply mask and normalize  
+        modified_probs = base_probabilities * safety_mask
+        if np.sum(modified_probs) > 0:
+            modified_probs = modified_probs / np.sum(modified_probs)
+        else:
+            modified_probs = np.ones(len(self.action_space)) / len(self.action_space)
+        
+        return modified_probs
 
 class Belief():
     def __init__(self, graph_gt, agent_id=0, prior=None, forget_rate=0.0, seed=None):
@@ -30,7 +105,6 @@ class Belief():
         for x in graph_gt['nodes']:
             id2node[x['id']] = x
 
-        # Assume that between 2 nodes there is only one edge
         self.edge_belief = {}
         self.init_belief_commonsense()
         

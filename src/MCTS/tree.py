@@ -47,8 +47,8 @@ class Tree:
         self.count = count
         
         # Action space parameters
-        self.acc_target_range = [-3, 3]  # acceleration range
-        self.steering_target_range = [-np.pi/4, np.pi/4]  # steering angle range
+        self.acc_target_range = [-3.5, 3.5]  # acceleration range
+        self.steering_target_range = [-np.pi/6, np.pi/6]  # steering angle range
         self.acc_values = 13  # number of acceleration discretization
         self.steering_values = 13  # number of steering angle discretization
         
@@ -462,6 +462,8 @@ class Tree:
 
         return new_sample
 
+
+    # this function need to be changed
     def compute_map_infos(self, map, map_mask, th=0.1):
         """
         Compute map information

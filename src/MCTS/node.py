@@ -399,12 +399,7 @@ class Node:
         )
 
         # 更新状态
-        self.state = {
-            "position": pred_pos,
-            "speed": pred_speed,
-            "yaw": pred_yaw,
-            "trajectory": pred_pos,
-        }
+        self.state = self.tree.roll_sample(sample=past_state, pos=pred_pos, speed=pred_speed, yaw=pred_yaw)
         self.parent_state = self.state
 
     def get_past_action(self, list_acc, list_yr):
@@ -426,3 +421,33 @@ class Node:
             list_acc.reverse()
             list_yr.reverse()
             return list_acc, list_yr
+
+    def update_probas_argmax(self, actions, actions_q):
+        """
+        Update the probabilities of the node.
+
+        Args:
+            actions: actions
+            actions_q: actions q values
+
+        Returns:
+            self
+        """
+
+        acc_values, steering_values = self.tree.acc_values, self.tree.steering_values
+
+        if self.children:
+            for a in range(acc_values):
+                for yr in range(steering_values):
+                    idx = a * steering_values + yr
+                    if idx in self.children:
+                        actions[self.T, idx] += (
+                            self.children[a * self.tree.steering_values + yr].n
+                            + 10 * self.children[a * self.tree.steering_values + yr].n_perfect
+                        )
+
+            if actions[self.T].sum() > 0 and self.tree.action_frames - 1 > self.T:
+                child_max = np.argmax(actions[self.T])
+                return self.children[child_max].update_probas_argmax(actions, actions_q)
+            else:
+                return self

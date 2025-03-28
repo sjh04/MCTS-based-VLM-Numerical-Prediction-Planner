@@ -4,7 +4,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, Qwe
 from typing import Dict, List, Union
 import numpy as np
 from qwen_vl_utils import process_vision_info
-from utils import loading_model, loading_processor, loading_device
+import sys
+sys.path.append("/home/ubuntu/sjh04/MCTS-based-VLM-Numerical-Prediction-Planner/src")
+from utils import *
 
 # transform action to id 
 def action_to_id(action: str, action_space: List[str]) -> int:
@@ -23,24 +25,40 @@ def id_to_action(id: int, action_space: List[str]) -> str:
     return id_to_action[id]
 
 # build messages
-def build_messages(image: dict, prompt: str) -> list:
+def build_messages(image: dict, prompt: str, systerm_promt="You are the ego driver.") -> list:
     """
     Build the messages for the Qwen2.5-vl-3b model
     """
     messages = []
     content = []
 
-    for camera_name, camera_image in image.items():
-        content.append({
-            "type": "image",
-            "image": camera_image
-        })
-    content.append({"type": "text", "text": prompt})
+    # add system prompt
     messages.append({
-        "role": "user",
-        "content": content
+        "role": "system",
+        "content": systerm_promt
     })
+
+    # add image
+    if image is not None:
+        for camera_name, camera_image in image.items():
+            content.append({
+                "type": "image",
+                "image": camera_image
+            })
+        content.append({"type": "text", "text": prompt})
+        messages.append({
+            "role": "user",
+            "content": content
+        })
+    else:
+        content.append({"type": "text", "text": prompt})
+        messages.append({
+            "role": "user",
+            "content": content
+        })
+
     return messages
+
 
 # build state description
 def build_state_description(state: Dict) -> str:
@@ -58,8 +76,12 @@ def build_history_description(history: List[str]) -> str:
     Build the history description
     """
     history_description = "Previous actions:\n"
-    for action in history:
-        history_description += f"{action}\n"
+
+    if len(history) > 0:
+        for action in history:
+            history_description += f"{action}\n"
+    else:
+        history_description += "No previous actions"
     return history_description
 
 # build macro action prompt
@@ -68,6 +90,10 @@ def build_macro_action_prompt(state_description: str, history_description: str, 
     Build the prompt
     """
     action_space_str = "\n".join([f"{i}. {action}" for i, action in enumerate(action_space)])
+
+    if navigation_info is None:
+        navigation_info = "No navigation info available"
+        
     prompt = f"""Based on the following vehicle state, camera images, previous actions, 
         and navigation info, please analyze the situation and choose the most appropriate action from the action space.
         Consider safety, efficiency, and traffic rules.
@@ -138,6 +164,27 @@ def build_atomic_action_prompt(state_description: str, history_description: str,
     """
     return prompt
 
+def build_belief_prompt(state_description: str, action_space: list[str]) -> str:
+    """
+    Build the prompt
+    """
+    action_space_str = "\n".join([f"{i}. {action}" for i, action in enumerate(action_space)])
+    prompt = f"""Based on the following vehicle state and camera images, please analyze the situation 
+        and generate the most possible action the surrounding vehicle will take.
+        Consider safety, efficiency, and traffic rules.
+
+        Current vehicle state:
+        {state_description}
+
+        Action space:
+        {action_space_str}
+        
+        Please provide your analysis in the following json format:
+        {"vehicle_id": [id], "action": "the most possible action"}
+        """
+
+    return prompt
+
 # parse action from response
 def parse_action(response: str) -> str:
     """
@@ -186,11 +233,11 @@ def generate_output_text(device: torch.device, model: Qwen2_5_VLForConditionalGe
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    image_inputs, video_inputs = process_vision_info(messages)
+    print(f"input: {text}")
+    image_inputs, _ = process_vision_info(messages)
     inputs = processor(
         text=[text],
         images=image_inputs,
-        videos=video_inputs,
         padding=True,
         return_tensors="pt"
     ).to(device)
@@ -201,5 +248,16 @@ def generate_output_text(device: torch.device, model: Qwen2_5_VLForConditionalGe
     output_text = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    
+    print(f"output: {output_text}")
+
     return output_text
+
+def parse_json(json_output):
+    # Parsing out the markdown fencing
+    lines = json_output.splitlines()
+    for i, line in enumerate(lines):
+        if line == "```json":
+            json_output = "\n".join(lines[i+1:])  # Remove everything before "```json"
+            json_output = json_output.split("```")[0]  # Remove everything after the closing "```"
+            break  # Exit the loop once "```json" is found
+    return json_output

@@ -1,6 +1,9 @@
 import numpy as np
 import os
-from ..VLM.policy import HighLevelPolicyGenerator
+import sys
+sys.path.append('/home/ubuntu/sjh04/MCTS-based-VLM-Numerical-Prediction-Planner')
+from VLM.qwen import Qwen
+from src.VLM.policy import HighLevelPolicyGenerator
 
 DISCOUNT_FACTOR = 0.95
 
@@ -44,23 +47,23 @@ class StateNode:
     reward: reward of the state
     score: score of the state
     done: whether the state is terminal
-    predicted_reward: predicted reward of the state
-    use_llm: whether to use LLM to generate the state
     DISCOUNT_FACTOR: discount factor
     """
     def __init__(self, reward=0, done=False):
         self.ob = None
         self.look = None
         self.inv = None # inverse of the lookahead map
-        self.state = None
+        self.state = {} # current state of the vehicle, speed, lane, acceleration, and steering angle
         self.prev_action = None
         self.id = None
-        self.valid_actions = None
+        self.valid_actions = ["overtaking", "keeping_lane", "turning_left",
+                               "turning_right", "left_change", "right_change", "brake"]
         self.history = []
+        self.camera_images = None
+        self.navi_info = None
         self.parent = None
         self.parent_action_id = None
         self.best_action_node = None
-        
 
         self.N = 0
         self.children = []
@@ -68,23 +71,22 @@ class StateNode:
         self.reward = reward/(1-DISCOUNT_FACTOR)
         self.score = 0
         self.done = done
-        self.predicted_reward = 0
-        self.use_llm = False
 
 class MCTSAgent:
     """
     MCTS agent for the high-level MCTS.
     """
-    def __init__(self):
-        self.root = StateNode()
+    def __init__(self, model):
+        self.root = None
         self.action_nodes = []
-        self.state_nodes = []
-        self.action_space = ["overtaking", "keeping lane", "turning left", "turning right", "left change", "right change", "brake"]
+        self.state_nodes = {}
+        self.action_space = ["overtaking", "keeping_lane", "turning_left", 
+                             "turning_right", "left_change", "right_change", "brake"]
         self.DISCOUNT_FACTOR = 0.95
         self.MAX_DEPTH = 3
         self.MAX_ROLLOUTS = 10
         self.C_PUCT = 1.0  # PUCT exploration constant
-        self.vlm_policy = HighLevelPolicyGenerator()
+        self.vlm_policy = HighLevelPolicyGenerator(model)
 
     def select(self, state_node: StateNode):
         """
@@ -113,7 +115,10 @@ class MCTSAgent:
             return
         
         # using VLM to generate the action probability
-        action_probs = self.vlm_policy.generate_policy_id()
+        action_probs = self.vlm_policy.calculate_probabilities(
+            state = state_node.state, 
+            historys = state_node.history, 
+        )
         
         # create the action node for each valid action
         for action, prob in zip(self.action_space, action_probs):
@@ -174,11 +179,12 @@ class MCTSAgent:
         # need to be implemented
         return state_node.reward
 
-    def search(self, root_state: StateNode, num_simulations: int):
+    def search(self, num_simulations: int, state: dict, ob: dict, history: list, done, camera_image: dict, navi_info: str):
         """
         execute the MCTS search
         """
-        self.root = root_state
+        print("Start MCTS search")
+        self.root = self.build_state(ob, state, history, self.action_space, done, camera_image, navi_info)
         
         for _ in range(num_simulations):
             current = self.root
@@ -208,5 +214,41 @@ class MCTSAgent:
         """
         visits = [child.visits for child in self.root.children]
         return self.action_space[np.argmax(visits)]
+
+    def build_state(self, ob, state, history, valid_actions, done, camera_image=None, navi_info=None, reward=0, prev_action='<s>'):
+        state = StateNode()
+        state.ob = ob
+        # state.look = info['look']
+        # state.inv = info['inv']
+        state.state = state
+        state.done = done
+        # state.state = ob + info['look'] + info['inv']
+        state.reward = reward
+        # state.score = info['score']
+        state.prev_action = prev_action
+        state.history = history
+        state.camera_images = camera_image
+        state.id = self.state_id(history)
+        # state.id = ob + info['look'] + info['inv'] + str(reward) + str(info['score']) + prev_action
+        state.valid_actions = valid_actions
+        state.navi_info = navi_info
+
+            
+        state.children_probs = self.vlm_policy.calculate_probabilities(state, camera_image, history, navi_info)
+            
+        self.state_dict[state.id] = state
+        for valid_action in state.valid_actions:
+            if isinstance(state.valid_actions, dict):
+                state.children.append(ActionNode(state.valid_actions[valid_action]))
+            else:
+                state.children.append(ActionNode(valid_action))
+
+        return state
     
-    
+if __name__ == "__main__":
+    model = Qwen()
+    print("Model loaded")
+    agent = MCTSAgent(model)
+    root_state = StateNode()
+    best_action = agent.search(root_state, 10)
+    print(best_action)

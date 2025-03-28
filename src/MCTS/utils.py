@@ -568,3 +568,10 @@ def trajectory2action(trajectory, dt=0.5):
 
     return acc, st2, None
 
+
+def softmax(a, T=1):
+    a = np.array(a) / T
+    exp_a = np.exp(a)
+    sum_exp_a = np.sum(exp_a)
+    y = exp_a / sum_exp_a
+    return y
