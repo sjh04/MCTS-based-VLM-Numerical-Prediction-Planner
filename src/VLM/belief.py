@@ -19,6 +19,7 @@ class OtherVehicleAgent:
         self.transition_state = None
         self.action_space = ["overtaking", "keeping lane", "turning left", "turning right", 
                            "left change", "right change", "brake"]
+        self.belief = {}
         self.generate_belifs = VehicleBelief()
 
     def get_action(self):
@@ -53,7 +54,10 @@ class OtherVehicleAgent:
         """
         Transition the agent
         """
-
+        for agent_id in self.agent_ids:
+            action_prob = self.action_probs[agent_id]
+            action = np.random.choice(self.action_space, p=action_prob)
+            self.transition_state[agent_id] = self._transition_state(agent_id, action)
         self.current_state = self.transition_state
 
     def _calculate_probability(self, agent_id, action, trust_level=1.0, aggression=0.1):
@@ -67,7 +71,7 @@ class OtherVehicleAgent:
          # Apply domain rules to modify probabilities
         safety_mask = np.ones(len(self.action_space))
         
-        if self.current_state[agent_id]['speed'] > 100:  # High speed
+        if self.current_state[agent_id]['speed'] > 80:  # High speed
             # Reduce probability of sharp turns
             turn_indices = [i for i, a in enumerate(self.action_space) if 'turn' in a]
             for idx in turn_indices:
@@ -81,6 +85,28 @@ class OtherVehicleAgent:
             modified_probs = np.ones(len(self.action_space)) / len(self.action_space)
         
         return modified_probs
+
+    def _transition_state(self, agent_id, action):
+        """
+        Transition the state
+        """
+        current_state = self.current_state[agent_id]
+        new_state = copy.deepcopy(current_state)
+        if action == 'overtaking':
+            new_state['lane'] += 1
+        elif action == 'keeping lane':
+            pass
+        elif action == 'turning left':
+            new_state['lane'] -= 1
+        elif action == 'turning right':
+            new_state['lane'] += 1
+        elif action == 'left change':
+            new_state['lane'] -= 1
+        elif action == 'right change':
+            new_state['lane'] += 1
+        elif action == 'brake':
+            new_state['speed'] -= 1
+        return new_state
 
 class Belief():
     def __init__(self, graph_gt, agent_id=0, prior=None, forget_rate=0.0, seed=None):
