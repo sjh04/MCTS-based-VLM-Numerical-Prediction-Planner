@@ -1,3 +1,9 @@
 .cursor/
 __pycache__/
 *.pyc
+*.sif
+belief/
+output/
+*.log
+video/
+*.mp4
