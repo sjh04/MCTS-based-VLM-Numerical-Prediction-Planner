@@ -21,7 +21,7 @@ from gymnasium.wrappers import RecordVideo
 from src.VLM.belief import OtherVehicleAgent, Belief
 from src.MCTS.utils import get_simulation_params, get_vehicle_parameters, highway_lanes_to_path, highway_to_numpy_transform
 from src.MCTS.high_level_mcts import MCTSAgent as HighLevelMCTS
-from src.MCTS.tree import Tree as LowLevelMCTS
+# from src.MCTS.tree import Tree as LowLevelMCTS
 from src.HighwayEnv.goal_checker import GoalChecker
 from src.VLM.policy import get_mid_level_action
 from src.HighwayEnv.envScenario import EnvScenario
@@ -91,7 +91,11 @@ class MCTSEnv:
         
         # MCTS agents
         self.high_level_mcts = None
-        self.low_level_mcts = None
+
+        # DQN agent
+        self.dqn_agent = None
+        self.dqn_agent_replay_buffer = None
+        # self.low_level_mcts = None
         
         # Translation dictionaries for high-level to low-level actions
         self.high_to_low_action_mapping = {
@@ -185,34 +189,34 @@ class MCTSEnv:
         
         return self
 
-    def initialize_low_level_mcts(self, policy=None, mid_level_action=None, high_level_action=None, action=None):
-        """
-        Initialize the low-level MCTS Tree with current environment state
+    # def initialize_low_level_mcts(self, policy=None, mid_level_action=None, high_level_action=None, action=None):
+    #     """
+    #     Initialize the low-level MCTS Tree with current environment state
         
-        Args:
-            policy: Optional policy network for low-level MCTS
-            mid_level_action: Mid-level action parameters
-            action: Initial action
-        """
-        if self.env is None:
-            raise ValueError("Environment not initialized. Call reset() first.")
+    #     Args:
+    #         policy: Optional policy network for low-level MCTS
+    #         mid_level_action: Mid-level action parameters
+    #         action: Initial action
+    #     """
+    #     if self.env is None:
+    #         raise ValueError("Environment not initialized. Call reset() first.")
         
-        # Prepare initial state for Tree
-        init_state = self._create_tree_init_state()
+    #     # Prepare initial state for Tree
+    #     init_state = self._create_tree_init_state()
         
-        # Initialize Tree with current world state
-        self.low_level_mcts = LowLevelMCTS(
-            env=self.env,
-            mcts_env=self,
-            ego_vehicle=self.env.unwrapped.vehicle,
-            init_state=init_state,
-            policy=policy,
-            high_level_action=high_level_action,
-            mid_action=mid_level_action,
-            action=action,
-        )
+    #     # Initialize Tree with current world state
+    #     self.low_level_mcts = LowLevelMCTS(
+    #         env=self.env,
+    #         mcts_env=self,
+    #         ego_vehicle=self.env.unwrapped.vehicle,
+    #         init_state=init_state,
+    #         policy=policy,
+    #         high_level_action=high_level_action,
+    #         mid_action=mid_level_action,
+    #         action=action,
+    #     )
         
-        return self.low_level_mcts
+    #     return self.low_level_mcts
 
 
     def reset(self, episode=None, step=None, **kwargs):
