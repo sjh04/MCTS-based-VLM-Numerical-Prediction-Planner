@@ -51,7 +51,7 @@ class OtherVehicleAgent:
             data = json.load(f) # list of dict
             # print(f"data: {data}, type: {type(data)}")
 
-        print(f"data: {data}, type: {type(data)}")
+        # print(f"data: {data}, type: {type(data)}")
 
         for item in data:
             vehicle_id = item['vehicle_id']

@@ -21,10 +21,13 @@ from gymnasium.wrappers import RecordVideo
 from src.VLM.belief import OtherVehicleAgent, Belief
 from src.MCTS.utils import get_simulation_params, get_vehicle_parameters, highway_lanes_to_path, highway_to_numpy_transform
 from src.MCTS.high_level_mcts import MCTSAgent as HighLevelMCTS
+from src.MCTS.dqn import DQN, ReplayBuffer # Added DQN imports
+import torch # Added for DQN
 # from src.MCTS.tree import Tree as LowLevelMCTS
 from src.HighwayEnv.goal_checker import GoalChecker
 from src.VLM.policy import get_mid_level_action
 from src.HighwayEnv.envScenario import EnvScenario
+from src.HighwayEnv.stategraph import StateGraph, EnvironmentState
 
 
 class MCTSEnv:
@@ -32,15 +35,21 @@ class MCTSEnv:
         # Highway Environment connection
         self.env_id = env_id
         self.config = config or {}
-        self._setup_default_config()
+        self._setup_default_config() # Initializes self.config if it's empty
+        
+        # Merge provided config with defaults, then apply to env
+        env_gym_config = {**self.config, **config} if config else self.config
+        self.config = env_gym_config # Update self.config to be the final merged one
+
         self.env = gym.make(self.env_id, render_mode="rgb_array")
-        self.env.configure(self.config)
+        self.env.configure(self.config) # Configure gym env with final config
         self.video_path = "/home/ubuntu/sjh04/MCTS-based-VLM-Numerical-Prediction-Planner/video"
+        # Ensure video_path directory exists
+        os.makedirs(self.video_path, exist_ok=True)
         self.env = RecordVideo(self.env, video_folder=self.video_path, episode_trigger=lambda e: True)  # record all episodes
         self.env_scenario = None
-        # self.env.unwrapped.set_record_video_wrapper(self.env)
-
-        self.frames = config["simulation_frequency"]
+        
+        self.frames = self.config.get("simulation_frequency", 10) # Use .get for safety
         
         # Environment state management
         self.state_graph = StateGraph()
@@ -48,56 +57,96 @@ class MCTSEnv:
         self.belief_states = {}
         self.agent_ids = None
 
-        self.acc_target_range = [-3, 3]  # m/s² (Highway Environment typical range)
-        self.steering_target_range = [-np.pi/4, np.pi/4]  # rad (Highway Environment typical range)
-        self.acc_values = 13  # Number of discrete acceleration values
-        self.steering_values = 13  # Number of discrete steering values
-        self.acc_coef = (self.acc_target_range[1] - self.acc_target_range[0]) / (self.acc_values - 1)
-        self.steer_coef = (self.steering_target_range[1] - self.steering_target_range[0]) / (self.steering_values - 1)
+        self.acc_target_range = self.config.get("action", {}).get("acceleration_range", [-3, 3])
+        self.steering_target_range = self.config.get("action", {}).get("steering_range", [-np.pi/4, np.pi/4])
+        
+        # DQN related params from config or defaults
+        self.acc_values = self.config.get("num_throttle_bins", 13)
+        self.steering_values = self.config.get("num_steering_bins", 13)
+
+        self.acc_coef = (self.acc_target_range[1] - self.acc_target_range[0]) / (self.acc_values - 1) if self.acc_values > 1 else 0
+        self.steer_coef = (self.steering_target_range[1] - self.steering_target_range[0]) / (self.steering_values - 1) if self.steering_values > 1 else 0
         
         # Goal tracking
         self.current_goal = None
         self.goal_checker = GoalChecker()
         
         # Environment parameters
-        self.low_level_action = [0, 0]
+        self.low_level_action_continuous = [0.0, 0.0] 
         self.mid_level_action = None
         self.ego_vehicle = None
         self.ego_vehicle_id = 0
         self.sensors = {}
-        self.camera_images = {}  # Empty placeholder for compatibility
+        self.camera_images = {} 
         self.timestep = 0
-        self.road_network = road_network or self.env.unwrapped.road
+        self.road_network = road_network # or self.env.unwrapped.road (careful, unwrapped might not be ready)
         
-        # VLM model
         self.model = model
-
-        # Belief system
         self.belief = None
         self.belief_agent = None
         
-        # Observation and state
-        self.current_observation = None  # Store latest text observation
+        self.current_observation = None 
+        self.current_numerical_observation = None 
+        self.last_discrete_dqn_action = None 
         
-        # MCTS parameters
-        self.planning_horizon = 5.0  # seconds
+        self.planning_horizon = 5.0 
         self.action_space = self._get_action_space()
         self.reward_weights = {
-            'safety': 10.0,
-            'progress': 1.0, 
-            'comfort': 0.5,
-            'efficiency': 1.0
+            'safety': 10.0, 'progress': 1.0, 'comfort': 0.5, 'efficiency': 1.0
         }
         
-        # MCTS agents
         self.high_level_mcts = None
 
-        # DQN agent
-        self.dqn_agent = None
-        self.dqn_agent_replay_buffer = None
-        # self.low_level_mcts = None
+        # DQN agent configuration
+        # Default DQN config, can be overridden by self.config["dqn_config"]
+        default_dqn_params = {
+            "state_dim": int(np.prod(self.env.observation_space.shape)) if self.env.observation_space is not None else 60,
+            "hidden_dim": 256,
+            "learning_rate": 1e-4,
+            "gamma": 0.99,
+            "epsilon": 0.9, 
+            "epsilon_decay": 0.995,
+            "min_epsilon": 0.05,
+            "target_update": 20, 
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "buffer_capacity": 50000,
+            "batch_size": 128,
+            "num_throttle_bins": self.acc_values,
+            "num_steering_bins": self.steering_values,
+            "p_follow_llm": 0.3 
+        }
         
-        # Translation dictionaries for high-level to low-level actions
+        # Merge default DQN params with those from self.config (e.g., passed from main.py)
+        # self.config might contain "dqn_config" from main.py or individual dqn params
+        passed_dqn_config = self.config.get("dqn_config", {}) # Get the dqn_config dict if present
+        # Also allow overriding individual dqn params if they are directly in self.config
+        for key in default_dqn_params:
+            if key in self.config:
+                passed_dqn_config[key] = self.config[key]
+
+        self.dqn_config = {**default_dqn_params, **passed_dqn_config}
+
+        # Ensure state_dim is correctly set after env is available
+        if self.env.observation_space is not None:
+            self.dqn_config["state_dim"] = int(np.prod(self.env.observation_space.shape))
+        else: # Fallback if observation_space is somehow None after gym.make
+             self.dqn_config["state_dim"] = self.config.get("dqn_state_dim", 60)
+
+
+        self.dqn_agent = DQN(state_dim=self.dqn_config["state_dim"],
+                             hidden_dim=self.dqn_config["hidden_dim"],
+                             num_throttle_bins=self.dqn_config["num_throttle_bins"],
+                             num_steering_bins=self.dqn_config["num_steering_bins"],
+                             learning_rate=self.dqn_config["learning_rate"],
+                             gamma=self.dqn_config["gamma"],
+                             epsilon=self.dqn_config["epsilon"],
+                             target_update=self.dqn_config["target_update"],
+                             device=self.dqn_config["device"])
+        self.dqn_agent_replay_buffer = ReplayBuffer(self.dqn_config["buffer_capacity"])
+        
+        self.dqn_sub_steps = self.config.get("DQN_SUB_STEPS", 10)
+        self.use_llm_for_dqn_guidance = self.config.get("USE_LLM_FOR_DQN_GUIDANCE", False)
+
         self.high_to_low_action_mapping = {
             'overtaking': {'acceleration': [0.5, 1.0], 'steering': [-0.1, 0.1]},
             'keeping_lane': {'acceleration': [0.0, 0.5], 'steering': [-0.1, 0.1]},
@@ -108,15 +157,14 @@ class MCTSEnv:
             'brake': {'acceleration': [-0.5, -0.1], 'steering': [-0.1, 0.1]},
         }
         
-        # High-level instruction status tracking
         self.current_high_level_action = None
-        self.high_level_action_completed = True  # Start with True to generate first high-level action
+        self.high_level_action_completed = True 
         self.high_level_action_steps = 0
-        self.max_steps_per_high_level_action = 160  # Maximum steps before forcing new high-level action
+        self.max_steps_per_high_level_action = 160 
 
     def _setup_default_config(self):
-        """Set up default configuration for Highway Environment"""
-        if not self.config:
+        """Set up default configuration for Highway Environment if not already configured"""
+        if not self.config: # Only set defaults if self.config is empty
             self.config = {
                 "observation": {
                     "type": "Kinematics",
@@ -127,32 +175,30 @@ class MCTSEnv:
                     "order": "sorted"
                 },
                 "action": {
-                    "type": "ContinuousAction"
+                    "type": "ContinuousAction",
+                    "acceleration_range": [-3.0, 3.0], # Default, can be overridden
+                    "steering_range": [-np.pi/4, np.pi/4], # Default
                 },
                 "lanes_count": 3,
                 "vehicles_count": 15,
-                "duration": 40,
+                "duration": 400, # Increased default duration for longer episodes
                 "initial_spacing": 2,
-                "collision_reward": -1,
+                "collision_reward": -20, # More significant collision penalty
                 "reward_speed_range": [20, 30],
                 "simulation_frequency": 10,
-                "policy_frequency": 10,
+                "policy_frequency": 10, # Corresponds to high-level policy
                 "screen_width": 600,
                 "screen_height": 150,
                 "centering_position": [0.3, 0.5],
                 "scaling": 5.5,
                 "show_trajectories": True,
                 "render_agent": True,
-                "offscreen_rendering": False
+                "offscreen_rendering": False, # Set to True for headless
+                "manual_control": False,
+                "real_time_rendering": False,
             }
 
     def _get_action_space(self):
-        """
-        Define the high-level action space for planning in Highway Environment
-        
-        Returns:
-            Dictionary of high-level actions
-        """
         return {
             'overtaking': {'acceleration': 0.8, 'steering': 0.0},
             'keeping_lane': {'acceleration': 0.3, 'steering': 0.0},
@@ -164,17 +210,7 @@ class MCTSEnv:
         }
 
     def connect_to_MCTS(self, high_level_agent, low_level_agent=None):
-        """
-        Connect this environment to both high-level and low-level MCTS planning agents
-        
-        Args:
-            high_level_agent: High-level MCTS agent (from high-level-mcts.py)
-            low_level_agent: Low-level MCTS agent (from tree.py)
-        """
-        # Connect high-level MCTS
         self.high_level_mcts = high_level_agent
-        
-        # Pass environment configuration to high-level MCTS
         high_level_params = get_simulation_params(
             action_space=self.action_space,
             planning_horizon=self.planning_horizon,
@@ -182,1443 +218,707 @@ class MCTSEnv:
         )
         if hasattr(self.high_level_mcts, 'configure'):
             self.high_level_mcts.configure(high_level_params)
-        
-        # Connect low-level MCTS if provided
-        if low_level_agent:
-            self.low_level_mcts = low_level_agent
-        
         return self
 
-    # def initialize_low_level_mcts(self, policy=None, mid_level_action=None, high_level_action=None, action=None):
-    #     """
-    #     Initialize the low-level MCTS Tree with current environment state
-        
-    #     Args:
-    #         policy: Optional policy network for low-level MCTS
-    #         mid_level_action: Mid-level action parameters
-    #         action: Initial action
-    #     """
-    #     if self.env is None:
-    #         raise ValueError("Environment not initialized. Call reset() first.")
-        
-    #     # Prepare initial state for Tree
-    #     init_state = self._create_tree_init_state()
-        
-    #     # Initialize Tree with current world state
-    #     self.low_level_mcts = LowLevelMCTS(
-    #         env=self.env,
-    #         mcts_env=self,
-    #         ego_vehicle=self.env.unwrapped.vehicle,
-    #         init_state=init_state,
-    #         policy=policy,
-    #         high_level_action=high_level_action,
-    #         mid_action=mid_level_action,
-    #         action=action,
-    #     )
-        
-    #     return self.low_level_mcts
-
-
     def reset(self, episode=None, step=None, **kwargs):
-        """Reset environment to initial state"""
-        # Reset the Highway Environment
         obs, info = self.env.reset(**kwargs)
-        self.env_scenario = EnvScenario(self.env, self.env_id, 42)
-        self.env.unwrapped.set_record_video_wrapper(self.env)
+        if self.env.observation_space is not None and hasattr(self.env.observation_space, 'shape'):
+             self.current_numerical_observation = obs.flatten()
+        else: # Fallback for non-standard observation spaces
+            self.current_numerical_observation = np.array(obs).flatten()
 
-        # Get vehicle IDs
-        # Get ego vehicle reference
+        if self.road_network is None and hasattr(self.env.unwrapped, 'road'):
+            self.road_network = self.env.unwrapped.road
+
+        self.env_scenario = EnvScenario(self.env, self.env_id, seed=kwargs.get('seed', 42))
+        if hasattr(self.env.unwrapped, 'set_record_video_wrapper'): # Some envs might not have this
+            self.env.unwrapped.set_record_video_wrapper(self.env)
+
         self.ego_vehicle = self.env.unwrapped.vehicle
-        print(f"ego_vehicle_type: {type(self.ego_vehicle)}")
-        print(f"ego_vehicle: {self.ego_vehicle}")
         self.ego_vehicle_id = id(self.ego_vehicle) % 1000
-        print(f"ego_vehicle_id: {self.ego_vehicle_id}")
         
-        # Initialize state and belief
         self.timestep = 0
         self.agent_history.clear()
         initial_state = self._capture_current_state()
         self.state_graph.add_node(initial_state)
         self._update_belief_state(initial_state, episode=episode, step=step)
         
-        # Reset low-level action
-        self.low_level_action = [0, 0]
-
-        # Reset mid-level action
+        self.low_level_action_continuous = [0.0, 0.0]
+        self.last_discrete_dqn_action = None
         self.mid_level_action = None
-
-        # Reset high-level action tracking
         self.current_high_level_action = None
         self.high_level_action_completed = True
         self.high_level_action_steps = 0
+
+        # Reset DQN epsilon at the start of an episode or based on external control
+        # If args.dqn_epsilon_start is used, it should be set by the training script.
+        # This is for inter-episode decay if not overridden.
+        self.dqn_agent.epsilon = max(
+            self.dqn_config["min_epsilon"], 
+            self.dqn_agent.epsilon * self.dqn_config["epsilon_decay"]
+        )
         
-        # Get observation for agent
-        observation = self._get_observation()
+        observation_text = self._get_observation() 
         valid_actions = self.get_valid_actions()
         
-        # Return initial observation and action space
-        return observation, valid_actions
+        return observation_text, valid_actions
 
-    def step(self, action, episode=None, step=None):
-        """Execute action and return environment feedback"""
-        # Validate action
-        # if not self._is_action_valid(action):
-        #     raise ValueError(f"Invalid action: {action}")
+    def step(self, action_continuous, episode=None, step_num_low_level=None):
+        print(f"Action taken: {action_continuous}")
+        obs_numerical, reward, terminated, truncated, info = self.env.step(action_continuous)
         
-        # Execute action in simulator
-        print(f"Executing action: {action}")
-        # control = self._action_to_control(action)
-        print(f"Control: {action}")
-        obs, reward, terminated, truncated, info = self.env.step(action)
+        if self.env.observation_space is not None and hasattr(self.env.observation_space, 'shape'):
+            next_numerical_observation = obs_numerical.flatten()
+        else:
+            next_numerical_observation = np.array(obs_numerical).flatten()
 
-        # Get position of the ego vehicle
-        ego_position = self.env.unwrapped.vehicle.position
 
-        self.env.render()
+        if hasattr(self.env.unwrapped, 'vehicle') and self.env.unwrapped.vehicle:
+             ego_position = self.env.unwrapped.vehicle.position
+        else:
+            ego_position = np.array([0.0, 0.0]) # Fallback
 
-        self.env.unwrapped.automatic_rendering_callback = self.env.video_recorder.capture_frame()
-
+        # self.env.render() # Rendering can be slow, consider conditional rendering
+        if hasattr(self.env.unwrapped, 'automatic_rendering_callback') and self.env.video_recorder:
+            self.env.unwrapped.automatic_rendering_callback = self.env.video_recorder.capture_frame()
 
         self.timestep += 1
-        # print("========================")
-        # print(f"obs: {obs}")
-        # print("=================")
-        # Update environment state
-        current_state = self._capture_current_state()
-        self.state_graph.add_node(current_state)
+        done_flag = terminated or truncated
+
+        if self.dqn_agent_replay_buffer is not None and \
+           self.last_discrete_dqn_action is not None and \
+           self.current_numerical_observation is not None:
+            self.dqn_agent_replay_buffer.add(self.current_numerical_observation, 
+                                             self.last_discrete_dqn_action, 
+                                             reward, 
+                                             next_numerical_observation, 
+                                             done_flag)
         
-        # Update belief system
-        self._update_belief_state(current_state, episode=episode, step=step)
+        self.current_numerical_observation = next_numerical_observation
+
+        if self.dqn_agent is not None and \
+           self.dqn_agent_replay_buffer.size() >= self.dqn_config["batch_size"] and \
+           self.timestep % self.dqn_config.get("train_frequency", 1) == 0: # Optional: train every N steps
+            transitions_sample = self.dqn_agent_replay_buffer.sample(self.dqn_config["batch_size"])
+            states_batch, actions_batch, rewards_batch, next_states_batch, dones_batch = zip(*transitions_sample)
+            transition_dict = {
+                'states': np.array(states_batch), 'actions': np.array(actions_batch), 
+                'rewards': np.array(rewards_batch), 'next_states': np.array(next_states_batch),
+                'dones': np.array(dones_batch)
+            }
+            self.dqn_agent.update(transition_dict)
+
+        current_env_state = self._capture_current_state()
+        self.state_graph.add_node(current_env_state)
+        self._update_belief_state(current_env_state, episode=episode, step=step_num_low_level)
         
-        # Calculate reward and check if done
-        observation = self._get_observation()
-        # reward = self._calculate_reward(action)
-        done = terminated or truncated
+        observation_text = self._get_observation()
         valid_actions = self.get_valid_actions()
+
+        # Store the high-level action name that was active during this low-level step
+        hl_action_name_for_history = self.current_high_level_action if self.current_high_level_action else "initial_driving"
+        self.agent_history.append((hl_action_name_for_history, observation_text, reward)) # Changed from action_continuous
         
-        # Update history
-        self.agent_history.append((action, observation, reward))
-        
-        # Check if current high-level action is completed
         if self.current_high_level_action is not None:
             self.high_level_action_steps += 1
             self.high_level_action_completed = self._check_high_level_action_completed(
-                self.current_high_level_action, 
-                obs, 
-                current_state
+                self.current_high_level_action, obs_numerical, current_env_state
             )
-            
-            # Force high-level action completion after max steps
-            # if self.high_level_action_steps >= self.max_steps_per_high_level_action:
-            #     self.high_level_action_completed = True
         
-        # Create info dict with additional data for MCTS
         info_dict = {
             'timestep': self.timestep,
             'belief_states': deepcopy(self.belief_states),
             'camera_images': self.camera_images,
             'risk_assessment': self._assess_risk() if self.belief else None,
-            'original_info': info,
+            'original_info': info, # Original info from gym env step
             'high_level_action': self.current_high_level_action,
-            'high_level_completed': self.high_level_action_completed
+            'high_level_completed': self.high_level_action_completed,
+            'ego_speed': self.ego_vehicle.speed if self.ego_vehicle else 0,
+            'on_road': self.ego_vehicle.on_road if self.ego_vehicle else True,
         }
         
-        return observation, reward, done, info_dict, valid_actions, ego_position
-
-    def mcts_step(self, action):
-        """
-        Execute a high-level action in a simulated environment (not the real environment)
-        and update beliefs accordingly. Used by MCTS for planning.
-        
-        Args:
-            action: High-level action to execute
-            
-        Returns:
-            tuple: (observation, reward, done, history, valid_actions)
-        """
-        # Create a copy of the current state to simulate without affecting real environment
-        sim_state = self._copy_state_for_simulation()
-        
-        # Convert high-level action to control commands
-        control = self._action_to_control(action)
-        
-        # Simulate the action's effect on the copied state
-        sim_next_state = self._simulate_step(sim_state, control)
-        
-        # Update simulated timestep
-        sim_timestep = self.timestep + 1
-        
-        # Update belief system with simulated state
-        self._update_belief_with_simulation(sim_next_state)
-        
-        # Calculate reward for the simulated action
-        reward = self._calculate_reward(action)
-        
-        # Check if the simulated state represents a terminal state
-        done = self._check_terminal_state(sim_next_state)
-        
-        # Get observation from simulated state
-        observation = self._get_observation_from_state(sim_next_state)
-        
-        # Update simulated history
-        sim_history = self.agent_history.copy()
-        sim_history.append((action, observation, reward))
-        history = [item[0] for item in sim_history]  # Extract just the actions
-        
-        # Get valid actions in the new state
-        valid_actions = self.get_valid_actions()
-        
-        return observation, reward, done, history, valid_actions
-    
-    def _copy_state_for_simulation(self):
-        """
-        Create a deep copy of the current environment state for simulation purposes.
-        
-        Returns:
-            dict: Copied state for simulation
-        """
-        # Capture the current state to use as a base
-        current_state = self._capture_current_state()
-        
-        # Return a copy to avoid modifying the original
-        return deepcopy(current_state)
-    
-    def _simulate_step(self, state, control):
-        """
-        Simulate a step in the environment without affecting the real environment.
-        
-        Args:
-            state: Current state to simulate from
-            control: Control action to apply
-            
-        Returns:
-            dict: Next simulated state
-        """
-        # Extract vehicle state from current state
-        ego_position = state.vehicle_state['position']
-        ego_velocity = state.vehicle_state['velocity']
-        ego_heading = state.vehicle_state['heading']
-        
-        # Extract acceleration and steering from control
-        acceleration = control[0]
-        steering = control[1]
-        
-        # Apply simple kinematic model to update position and velocity
-        dt = 0.1  # Default time step
-        
-        # Update velocity based on acceleration
-        new_speed = np.linalg.norm(ego_velocity) + acceleration * dt
-        new_speed = max(0, new_speed)  # Ensure non-negative speed
-        
-        # Update heading based on steering and velocity
-        wheel_base = 3.5  # Default value for Highway Environment
-        angular_velocity = new_speed * np.tan(steering) / wheel_base
-        new_heading = ego_heading + angular_velocity * dt
-        
-        # Calculate new velocity vector
-        new_velocity = np.array([
-            new_speed * np.cos(new_heading),
-            new_speed * np.sin(new_heading)
-        ])
-        
-        # Update position
-        new_position = ego_position + new_velocity * dt
-        
-        # Create new state with updated values
-        new_state = deepcopy(state)
-        new_state.vehicle_state['position'] = new_position
-        new_state.vehicle_state['velocity'] = new_velocity
-        new_state.vehicle_state['heading'] = new_heading
-        
-        return new_state
-    
-    def _update_belief_with_simulation(self, simulated_state):
-        """
-        Update belief system with simulated state information.
-        This is used for maintaining consistent beliefs during MCTS planning.
-        
-        Args:
-            simulated_state: The simulated next state
-        """
-        # Skip if belief system is not initialized
-        if not hasattr(self, 'belief') or self.belief is None:
-            return
-            
-        # Create observation data structure for belief update
-        observation_data = {
-            'vehicles': {},
-            'timestamp': self.timestep + 1  # Simulated next timestep
-        }
-        
-        # Extract vehicle information from simulated state
-        if 'vehicles' in simulated_state.env_state.keys():
-            for i, vehicle in enumerate(simulated_state.env_state['vehicles']):
-                vehicle_id = vehicle.get('id', i)
-                
-                # Skip ego vehicle
-                if vehicle_id == self.ego_vehicle_id:
-                    continue
-                    
-                # Add vehicle data to observation
-                observation_data['vehicles'][vehicle_id] = {
-                    'position': vehicle.get('position', [0, 0]),
-                    'velocity': vehicle.get('velocity', [0, 0]),
-                    'heading': vehicle.get('heading', 0),
-                    'lane': vehicle.get('lane', 0),
-                    'speed': np.linalg.norm(vehicle.get('velocity', [0, 0]))
-                }
-        
-        # Update belief with this observation data (without changing the main belief state)
-        # We're creating a temporary belief copy for simulation
-        sim_belief = deepcopy(self.belief)
-        sim_belief.update_from_observation(observation_data)
-        
-        # Store the updated belief state for this simulation
-        self.sim_belief = sim_belief
-    
-    def _get_observation_from_state(self, state):
-        """
-        Convert a state dictionary to an observation string for the agent.
-        
-        Args:
-            state: State dictionary
-            
-        Returns:
-            str: Observation text
-        """
-        # Create a text observation similar to _get_observation but using the provided state
-        if not state:
-            return "Environment not initialized"
-            
-        # Extract key information
-        ego_position = state.vehicle_state['position']
-        ego_velocity = state.vehicle_state['velocity']
-        ego_heading = state.vehicle_state['heading']
-        
-        # Calculate speed
-        speed = np.linalg.norm(ego_velocity) * 3.6  # Convert to km/h
-        
-        # Build observation string
-        observation = f"Vehicle at location ({ego_position[0]:.1f}, {ego_position[1]:.1f}) "
-        observation += f"moving at {speed:.1f} km/s with heading {ego_heading:.1f} radians. "
-        
-        return observation
-    
-    def _check_terminal_state(self, state):
-        """
-        Check if a state represents a terminal condition (collision, off-road, goal reached).
-        
-        Args:
-            state: State to check
-            
-        Returns:
-            bool: True if state is terminal, False otherwise
-        """
-        # Check for collision
-        # if 'collision' in state and state.vehicle_state.keys():
-        #     return True
-            
-        # # Check for off-road
-        # if 'off_road' in state and state.vehicle_state.keys():
-        #     return True
-            
-        # # Check for goal reached
-        # if 'goal_reached' in state and state.vehicle_state.keys():
-        #     return True
-            
-        # Default: not terminal
-        return False
+        return observation_text, reward, done_flag, info_dict, valid_actions, ego_position
 
     def plan_next_action(self, planning_time=0.1, step=None, previous_action=None):
-        """
-        Plan the next action using both high-level and low-level MCTS
-        
-        Args:
-            planning_time: Planning time budget in seconds
-            
-        Returns:
-            action: The low-level action to execute
-            metrics: Dictionary with planning metrics
-        """
         if not self.high_level_mcts:
             raise ValueError("MCTS agents not connected. Call connect_to_MCTS first.")
-        
+        if not self.dqn_agent:
+            raise ValueError("DQN agent not initialized.")
+            
         metrics = {}
         start_time = time.time()
 
-        # Check if we need to run high-level MCTS to get a new high-level action
-        if self.high_level_action_completed:
-            # Get current observation for high-level planning
-            observation = self._get_observation()
-            history = [item[0] for item in self.agent_history] if self.agent_history else []
-            valid_actions = self.get_valid_actions()
+        if self.high_level_action_completed or self.current_high_level_action is None:
+            observation_text = self._get_observation() 
+            # History will now be a list of high-level action strings
+            history_for_vlm = [item[0] for item in self.agent_history] if self.agent_history else []
+            valid_hl_actions = self.get_valid_actions()
             
-            # Run high-level MCTS
             high_level_start = time.time()
-            high_level_action = self.high_level_mcts.search(
-                observation,      # Text observation for Highway Environment
-                history, 
-                self.timestep, 
-                valid_actions, 
-                False,            # not done
-                self.camera_images,  # Empty placeholder for compatibility 
-                self._get_navigation_info()
+            # Ensure camera_images and navi_info are available or have defaults
+            cam_images = self.camera_images if hasattr(self, 'camera_images') else {}
+            nav_info = self._get_navigation_info() if hasattr(self, '_get_navigation_info') else {}
+
+            high_level_action_name = self.high_level_mcts.search(
+                observation_text, history_for_vlm, self.timestep, valid_hl_actions, 
+                False, cam_images, nav_info
             )
             high_level_time = time.time() - high_level_start
             
-            # Store new high-level action and reset step counter
-            self.current_high_level_action = high_level_action
+            self.current_high_level_action = high_level_action_name
             self.high_level_action_completed = False
             self.high_level_action_steps = 0
             
             metrics['high_level_time'] = high_level_time
-            metrics['high_level_action'] = high_level_action
-            print(f"New high-level action: {high_level_action}")
+            metrics['high_level_action'] = self.current_high_level_action
+            # print(f"New high-level action: {self.current_high_level_action}")
 
-            # Get mid-level action from VLM model
-            self.state_description = observation
-            self.history_description = history
-            self.mid_level_action = get_mid_level_action(self.model, self.state_description, self.history_description, high_level_action, observation=observation)
-
-            # self.mid_level_action = self._high2mid_level_action(high_level_action)
-
-            # initialize low-level MCTS with mid-level action
-            initialize_low_level_mcts = self.initialize_low_level_mcts(
-                policy=self.model,
-                mid_level_action=self.mid_level_action,
-                action=self.low_level_action,
-                high_level_action=self.current_high_level_action
-            )
-
+            if self.use_llm_for_dqn_guidance:
+                # Ensure observation_text and history_for_vlm are current for mid_level_action call
+                current_obs_text_for_mid = observation_text # observation_text is set if new HL action planned
+                current_history_for_mid = history_for_vlm # history_for_vlm is set if new HL action planned
+                
+                self.mid_level_action = get_mid_level_action(
+                    self.model, current_obs_text_for_mid, current_history_for_mid, 
+                    self.current_high_level_action, observation=current_obs_text_for_mid
+                )
         else:
             metrics['high_level_action'] = self.current_high_level_action
             metrics['high_level_time'] = 0.0
-            print(f"Continuing high-level action: {self.current_high_level_action} (step {self.high_level_action_steps})")
-        
-        # Convert high-level action to constraints for low-level MCTS
-        constraints = self._high_to_low_level_constraints(self.current_high_level_action)
-        
-        # Run low-level MCTS with remaining planning time
-        low_level_action = {}
-        if self.low_level_mcts:
-            self.low_level_action = previous_action
-            
-            if step != 0:
-                observation = self._get_observation()
-                history = [item[0] for item in self.agent_history] if self.agent_history else []
-                self.mid_level_action = get_mid_level_action(self.model, observation, 
-                                                             history, self.current_high_level_action, observation=self.current_observation)
-                initialize_low_level_mcts = self.initialize_low_level_mcts(
-                    policy=self.model,
-                    mid_level_action=self.mid_level_action,
-                    action=self.low_level_action,
-                    high_level_action=self.current_high_level_action
+            # print(f"Continuing high-level action: {self.current_high_level_action} (step {self.high_level_action_steps})")
+            if self.use_llm_for_dqn_guidance:
+                # HL action not re-planned, so get current observation and history
+                current_obs_text_for_mid = self._get_observation()
+                current_history_for_mid = [item[0] for item in self.agent_history] if self.agent_history else []
+                self.mid_level_action = get_mid_level_action(
+                    self.model, current_obs_text_for_mid, current_history_for_mid,
+                    self.current_high_level_action, observation=current_obs_text_for_mid
                 )
-            
-            # Get history for context
-            history = [item[0] for item in self.agent_history] if self.agent_history else []
-            # self.low_level_mcts.update_sensors(self.camera_images, history)
-            
-            # Apply constraints to low-level MCTS
-            # This would involve setting appropriate action ranges based on the high-level action
-            if hasattr(self.low_level_mcts, 'acc_target_range') and 'acc_range' in constraints:
-                self.low_level_mcts.acc_target_range = constraints['acc_range']
-            if hasattr(self.low_level_mcts, 'steering_target_range') and 'steering_range' in constraints:
-                self.low_level_mcts.steering_target_range = constraints['steering_range']
-            
-            # Run low-level MCTS simulation
-            remaining_time = planning_time - (time.time() - start_time)
-            low_level_start = time.time()
-            k = max(32, int(remaining_time * 100))  # Adaptive simulation count
-            # k = 2
-            acc_seq, steering_seq = self.low_level_mcts.simulate(k=k)
-            print("=======================")
-            print(f"acc_seq shape: {acc_seq.shape}")
-            print(f"steering_seq shape: {steering_seq.shape}")
-            acc_seq[:, 6] += (acc_seq.sum(-1) == 0) * 0.1
-            steering_seq[:, 6] += (steering_seq.sum(-1) == 0) * 0.1
-            # print(f"acc_seq: {acc_seq}")
-            # print(f"steering_seq: {steering_seq}")
-            # Extract the immediate control action from the sequences
-            # acc = acc_seq[0]  # First acceleration value
-            # steering = steering_seq[0]  # First steering value
-            
-            # Convert to Highway Environment control format
-            low_level_action['acceleration'] = acc_seq
-            low_level_action['steering'] = steering_seq
-            low_level_action['num_steps'] = 20
-            low_level_time = time.time() - low_level_start
-            metrics['low_level_time'] = low_level_time
-        else:
-            # If no low-level MCTS, convert high-level action directly to control
-            low_level_action = self._high_level_to_control(self.current_high_level_action)
         
-        # self.low_level_action = low_level_action
 
+
+        dqn_planning_start_time = time.time()
+        llm_suggested_continuous_action = None
+        if self.use_llm_for_dqn_guidance and self.mid_level_action and \
+           'acceleration' in self.mid_level_action and 'steering' in self.mid_level_action:
+            
+            raw_llm_acc = self.mid_level_action['acceleration']
+            raw_llm_steer = self.mid_level_action['steering']
+
+            # Normalize LLM action to [-1, 1] for DQN guidance
+            # Assumes symmetric ranges, e.g., acc_target_range is [-max_acc, max_acc]
+            # self.acc_target_range[1] would be max_acc (e.g., 3.0)
+            # self.steering_target_range[1] would be max_steer (e.g., np.pi/4)
+            
+            norm_llm_acc = 0.0
+            if self.acc_target_range[1] != 0: # Avoid division by zero
+                # If LLM output is already scaled, e.g. -3 to 3, divide by the max of that scale
+                norm_llm_acc = raw_llm_acc / self.acc_target_range[1]
+            
+            norm_llm_steer = 0.0
+            if self.steering_target_range[1] != 0: # Avoid division by zero
+                # If LLM output is e.g. -0.79 to 0.79, divide by the max of that scale
+                norm_llm_steer = raw_llm_steer / self.steering_target_range[1]
+            
+            # Clip to ensure they are strictly within [-1, 1] as expected by DQN's discrete action mapping
+            norm_llm_acc = np.clip(norm_llm_acc, -1.0, 1.0)
+            norm_llm_steer = np.clip(norm_llm_steer, -1.0, 1.0)
+            
+            llm_suggested_continuous_action = (norm_llm_acc, norm_llm_steer)
+
+        if self.current_numerical_observation is None:
+            print("Warning: current_numerical_observation is None in plan_next_action. Using default action.")
+            # Choose a neutral discrete action (e.g., middle action if action_dim is odd, or specific index)
+            neutral_throttle_idx = self.dqn_config["num_throttle_bins"] // 2
+            neutral_steering_idx = self.dqn_config["num_steering_bins"] // 2
+            discrete_action = neutral_throttle_idx * self.dqn_config["num_steering_bins"] + neutral_steering_idx
+        else:
+            discrete_action = self.dqn_agent.take_action(
+                self.current_numerical_observation,
+                llm_suggested_continuous_action=llm_suggested_continuous_action,
+                p_follow_llm=self.dqn_config["p_follow_llm"] if self.use_llm_for_dqn_guidance else 0.0
+            )
+        
+        self.last_discrete_dqn_action = discrete_action 
+        throttle, steering = self.dqn_agent.get_continuous_action_pair(discrete_action)
+        continuous_action_for_env = [throttle, steering]
+        self.low_level_action_continuous = continuous_action_for_env
+
+        dqn_planning_time = time.time() - dqn_planning_start_time
+        metrics['low_level_time'] = dqn_planning_time
+        metrics['low_level_planner'] = "DQN"
+        
         total_time = time.time() - start_time
         metrics['total_time'] = total_time
         
-        self.low_level_action = [low_level_action['acceleration'], low_level_action['steering']]
+        return [throttle, steering], metrics
 
-        return low_level_action, metrics
-
-    def _check_high_level_action_completed(self, high_level_action, observation, current_state):
+    def execute_policy_step(self, episode=None, hl_step_num=None):
         """
-        Check if the current high-level action has been completed
+        Executes one high-level policy step, which involves planning and 
+        executing low-level DQN actions for a number of sub-steps.
+        """
+        # 1. Plan next low-level action using the hierarchy
+        continuous_action_from_dqn, planning_metrics = self.plan_next_action(
+            planning_time=self.config.get("planning_time_budget", 0.1),
+            step=self.timestep 
+        )
+
+        accumulated_reward_hl_step = 0.0
+        done_hl_step = False
+        info_from_last_low_level_step = {}
         
-        Args:
-            high_level_action: Current high-level action
-            observation: Current observation
-            current_state: Current environment state
+        # 2. Execute the chosen low-level action for dqn_sub_steps
+        actual_sub_steps_taken = 0
+        for i in range(self.dqn_sub_steps):
+            actual_sub_steps_taken +=1
+            # self.step executes the continuous_action_from_dqn, updates DQN, etc.
+            text_obs_ll, reward_ll, done_ll, info_ll, _, _ = self.step(
+                continuous_action_from_dqn, 
+                episode=episode, 
+                step_num_low_level=self.timestep # self.step increments self.timestep
+            )
             
-        Returns:
-            completed: Whether the high-level action is completed
-        """
-        # Get ego vehicle state
-        if self.ego_vehicle is None:
-            return True
-            
+            accumulated_reward_hl_step += reward_ll
+            info_from_last_low_level_step = info_ll 
+            if done_ll:
+                done_hl_step = True
+                break 
+        
+        # 3. Get the new high-level text observation after all sub-steps
+        next_high_level_text_observation = self._get_observation()
+        
+        # 4. Final info dictionary for this high-level step
+        final_info_hl_step = {
+            **planning_metrics, 
+            **info_from_last_low_level_step, 
+            'dqn_steps_executed': actual_sub_steps_taken,
+            'accumulated_hl_reward': accumulated_reward_hl_step
+        }
+        
+        return next_high_level_text_observation, accumulated_reward_hl_step, done_hl_step, final_info_hl_step
+
+    def _check_high_level_action_completed(self, high_level_action, observation_numerical, current_env_state):
+        if self.ego_vehicle is None: return True
         vehicle = self.ego_vehicle
         
-        # Get information based on high-level action type
-        if high_level_action == 'overtaking':
-            # Check if we've passed a vehicle
-            if hasattr(vehicle, 'lane') and hasattr(vehicle, 'position'):
-                # Get surrounding vehicles
-                surrounding_vehicles = []
-                for v in self.env.unwrapped.road.vehicles:
-                    if v is not vehicle:
-                        v_lane = self.env.unwrapped.road.network.get_lane(v.lane_index)
-                        if v_lane and vehicle.lane == v_lane:
-                            # Check if vehicle is ahead and close
-                            if v.position[0] > vehicle.position[0] and v.position[0] - vehicle.position[0] < 20:
-                                surrounding_vehicles.append(v)
-                                
-                # Overtaking completed if no vehicles ahead in same lane
-                if not surrounding_vehicles:
-                    return True
-                    
-                # If we've moved to a different lane to overtake, that's progress
-                if hasattr(self.agent_history, 'lane_idx'):
-                    if vehicle.lane_index[2] != self.agent_history.lane_idx:
-                        # Changed lanes during overtaking
-                        return self.high_level_action_steps > 5  # Require some steps in new lane
-            
-        elif high_level_action == 'lane_change' or high_level_action == 'left_change' or high_level_action == 'right_change':
-            # Check if lane has changed
-            if len(self.agent_history) > 0:
-                # Get previous lane
-                prev_lane = None
-                for action, obs, reward in reversed(list(self.agent_history)[:-1]):
-                    # Check if the observation is a string (text observation)
-                    if isinstance(obs, str):
-                        # Try to extract lane information from the text observation
-                        if "Currently in lane" in obs:
-                            try:
-                                # Extract the lane number from text like "Currently in lane 2. "
-                                lane_text = obs.split("Currently in lane")[1].split(".")[0].strip()
-                                prev_lane = int(lane_text)
-                                break
-                            except (IndexError, ValueError):
-                                continue
-                    # If observation is a dictionary (as originally expected)
-                    elif isinstance(obs, dict) and 'lane' in obs and obs['lane'] is not None:
-                        prev_lane = obs['lane']
-                        break
-                
-                # Get current lane
-                current_lane = None
-                if hasattr(vehicle, 'lane_index'):
-                    current_lane = vehicle.lane_index[2]
-                
-                # Lane change completed if lane changed and some steps elapsed
-                if prev_lane is not None and current_lane is not None and prev_lane != current_lane:
-                    return self.high_level_action_steps > 3  # Require some steps in new lane
+        # Simplified completion: after a fixed number of low-level steps
+        # More sophisticated checks can be added based on high_level_action type
+        # For example, for 'left_change', check if lane has actually changed.
+        # The self.high_level_action_steps counts low-level steps since HL action started.
         
-        elif high_level_action == 'keeping_lane':
-            # Keeping lane is continuous task, consider it "completed" after certain time
-            return self.high_level_action_steps > 10
-            
-        elif high_level_action == 'brake':
-            # Brake completed when speed is low
-            if hasattr(vehicle, 'speed'):
-                return vehicle.speed < 5  # m/s
+        # Max steps condition
+        if self.high_level_action_steps >= self.config.get("max_ll_steps_per_hl_action", self.dqn_sub_steps * 3): # e.g., 3 HL policy frequencies
+            # print(f"HL action '{high_level_action}' timed out after {self.high_level_action_steps} LL steps.")
+            return True
+
+        # Goal-based completion (example for lane change)
+        if high_level_action in ['left_change', 'right_change']:
+            # This requires tracking previous lane or target lane.
+            # For simplicity, we can rely on a timeout or a more direct check.
+            # Let's assume GoalChecker or a similar mechanism could be used if a specific goal was set.
+            # For now, rely on timeout or a simple heuristic.
+            # Example: if vehicle is stable in a new lane.
+            # This is complex to check robustly without more state.
+            pass # Placeholder for more specific checks
+
+        # Default: complete after a certain number of low-level steps (e.g., policy_frequency)
+        # This is implicitly handled by the high-level loop in main.py calling execute_policy_step
+        # and plan_next_action deciding if a new HL action is needed.
+        # The self.high_level_action_steps is incremented in self.step().
+        # If plan_next_action is called, and high_level_action_completed is True, it plans a new one.
+        # So, this function should determine if the *current* HL action's objective is met.
+
+        # For now, let's use a simple step count for demonstration.
+        # A more robust way is to check if the *purpose* of the HL action is achieved.
+        if self.high_level_action_steps > self.config.get("policy_frequency", 10) * 0.8: # e.g. 80% of policy frequency
+             # This is a simple heuristic. Real completion should be goal-oriented.
+             # print(f"HL action '{high_level_action}' considered complete after {self.high_level_action_steps} LL steps (heuristic).")
+             return True
         
-        # Default completion check based on step count
-        return self.high_level_action_steps > 15
-
-    def update_sensors(self, camera_images=None, history=None):
-        """
-        Update sensor data for planning algorithms
-        
-        This is a compatibility method that works with both CARLA and Highway
-        environments. In Highway, we provide the observation text instead of
-        camera images.
-        """
-        # For Highway Environment, we don't need actual camera images
-        # Just create a placeholder dictionary to maintain compatibility with CARLA code
-        if camera_images:
-            self.camera_images = camera_images
-        else:
-            # Create placeholder camera image - this won't be used for actual perception
-            # The system will prioritize the text observation for Highway Environment
-            self.camera_images = {
-                'front': np.zeros((100, 100, 3), dtype=np.uint8)
-            }
-        
-        if history:
-            self.agent_history = history
-        
-        # Generate and store the current text observation
-        self.current_observation = self._get_observation()
-
-    def _action_to_control(self, action):
-        """Convert action to Highway Environment control"""
-        if isinstance(action, str) and action in self.action_space:
-            return np.array([
-                self.action_space[action]['acceleration'],
-                self.action_space[action]['steering']
-            ])
-        elif isinstance(action, list) and len(action) == 2:
-            return np.array(action)
-        elif isinstance(action, tuple) and len(action) == 2:
-            return np.array(action)
-        else:
-            raise ValueError(f"Invalid action format: {action}")
-
-    def _high_to_low_level_constraints(self, high_level_action):
-        """
-        Convert high-level action to constraints for low-level MCTS
-        
-        Args:
-            high_level_action: High-level action string
-            
-        Returns:
-            constraints: Dictionary of constraints for low-level MCTS
-        """
-        # Get action mapping
-        action_mapping = self.high_to_low_action_mapping.get(
-            high_level_action, 
-            {'acceleration': [-0.5, 0.5], 'steering': [-0.2, 0.2]}  # Default if action not found
-        )
-        
-        # Create constraints for Tree
-        constraints = {
-            'acc_range': action_mapping['acceleration'],
-            'steering_range': action_mapping['steering']
-        }
-        
-        return constraints
-
-    def _high2mid_level_action(self, high_level_action):
-        """
-        Convert high-level action to mid-level action for VLM model
-        
-        Args:
-            high_level_action: High-level action string
-            
-        Returns:
-            mid_level_action: Mid-level action dictionary
-        """
-        # Map high-level actions to mid-level actions
-        mapping = {
-            'overtaking': {'acceleration': 1.5, 'steering': 0.2},
-            'keeping_lane': {'acceleration': 0.0, 'steering': 0.0},
-            'turning_left': {'acceleration': 0.5, 'steering': -0.3},
-            'turning_right': {'acceleration': 0.2, 'steering': 0.3},
-            'left_change': {'acceleration': 0.5, 'steering': -0.2},
-            'right_change': {'acceleration': 0.5, 'steering': 0.2},
-            'brake': {'acceleration': -0.5, 'steering': 0.0}
-        }
-        
-        return mapping.get(high_level_action, {'acceleration': 0.3, 'steering': 0.0})
-
-    def _high_level_to_control(self, high_level_action):
-        """
-        Directly convert high-level action to low-level control
-        Used as fallback when low-level MCTS is not available
-        
-        Args:
-            high_level_action: High-level action string
-            
-        Returns:
-            control: List of [acceleration, steering]
-        """
-        # Map high-level actions to control values
-        mapping = {
-            'overtaking': [0.8, 0.0],  # [acceleration, steering]
-            'keeping_lane': [0.3, 0.0],
-            'turning_left': [0.2, -0.2],
-            'turning_right': [0.2, 0.2],
-            'left_change': [0.3, -0.2],
-            'right_change': [0.3, 0.2],
-            'brake': [-0.3, 0.0]
-        }
-        
-        return mapping.get(high_level_action, [0.3, 0.0])  # Default to maintain
-
-    def _create_tree_init_state(self):
-        """
-        Create initial state dictionary for the Tree (low-level MCTS)
-
-        States:
-            Map:
-            - map: [batch, lane, points, 2]
-            - map_mask: [batch, lane, points]
-            - additional_map: [batch, lane, points, 2]
-            - additional_map_mask: [batch, lane, points]
-            Agents:
-            - agents: [batch, agent, time, 5]
-            - agents_mask: [batch, agent, time, 1]
-            - agents_dim: [batch, agent, 2]
-            - prediction: [1, n_valid_agents, 1, 80, feature_dimension]
-            Ego:
-            - ego: [batch, time, 5]
-            - ego_pos: [batch, time, 2]
-            - ego_speed: [batch, time, 1]
-            - ego_heading: [batch, time, 1]
-            - ego_pred: [batch, frames, 2]
-            Other Road Information:
-            - static_objects: [batch, static_objects, 2]
-            - static_objects_mask: [batch, static_objects, 1]
-            - pedestrian: [batch, pedestrian, 2]
-            - pedestrian_mask: [batch, pedestrian, 1]
-            Parameters:
-            - max_speed: Maximum speed of the vehicle
-            - start_time: Start time of the simulation
-
-        
-        Returns:
-            init_state: Dictionary with state information for Tree
-        """
-        # Current ego vehicle state
-        ego_pos = self.env.unwrapped.vehicle.position
-        ego_vel = self.env.unwrapped.vehicle.velocity
-        ego_heading = self.env.unwrapped.vehicle.heading
-        ego_speed = np.linalg.norm(ego_vel)
-        ego_array = np.array([ego_pos[0], ego_pos[1], ego_heading])
-        ego = ego_array.reshape(1, 1, 3)  # Reshape to [batch, time, features]
-
-        # Get road and lane information
-        if hasattr(self.env.unwrapped, 'road'):
-            road = self.env.unwrapped.road
-            lanes = []
-            
-            # Collect lanes from road network
-            if hasattr(road, 'network'):
-                for _from in road.network.graph:
-                    for _to in road.network.graph[_from]:
-                        for lane in road.network.graph[_from][_to]:
-                            lanes.append(lane)
-            
-            print(f"Number of lanes: {len(lanes)}")
-
-            # Get vehicle dimensions
-            veh_dims = get_vehicle_parameters(self.env.unwrapped.vehicle)
-            veh_length = veh_dims['dimensions'][0] if veh_dims else 5.0
-            veh_width = veh_dims['dimensions'][1] if veh_dims else 2.0
-            
-            # Extract waypoints from lanes
-            waypoints = []
-            for lane in lanes:
-                if hasattr(lane, 'position'):
-                    # Sample points along the lane
-                    # print(f"lane length: {lane.length}")
-                    for i in range(0, int(lane.length) - 8, 10):
-                        waypoint_pos = lane.position(i, 0)
-                        waypoints.append(waypoint_pos)
-
-            print(f"Number of waypoints: {len(waypoints)}")
-            print(f"waypoints/length: {len(waypoints) / len(lanes)}")
-            # Create map representation from waypoints
-            if waypoints:
-                # print(f"Extracted {len(waypoints)} waypoints from lanes.")
-                map_data = np.array([waypoints]).reshape(1, len(lanes), int(len(waypoints)/len(lanes)), 2)
-                map_mask = np.ones((1, len(lanes), int(len(waypoints)/len(lanes))))
-            else:
-                # Default empty map
-                print("No waypoints found in lanes.")
-                map_data = np.zeros((1, 0, 1, 2))
-                map_mask = np.zeros((1, 0, 1))
-                
-            # print(f"Map data shape: {map_data.shape}, Map mask shape: {map_mask.shape}")
-            # Extract other vehicles information
-            vehicles = [v for v in road.vehicles if v is not self.env.unwrapped.vehicle]
-            print(f"Vehicles lens: {len(vehicles)}")
-            agents_data = []
-            
-            for i, vehicle in enumerate(vehicles):
-                if hasattr(vehicle, 'position') and hasattr(vehicle, 'velocity') and hasattr(vehicle, 'heading'):
-                    v_pos = vehicle.position
-                    v_vel = vehicle.velocity
-                    v_hdg = vehicle.heading
-                    v_length = getattr(vehicle, 'LENGTH', 5.0)
-                    v_width = getattr(vehicle, 'WIDTH', 2.0)
-                    
-                    agents_data.append({
-                        'id': i,
-                        'position': [v_pos[0], v_pos[1]],
-                        'velocity': [v_vel[0], v_vel[1]],
-                        'heading': v_hdg,
-                        'dimensions': [v_length, v_width]
-                    })
-                    
-            # Format agent data for Tree
-            # print(f"Number of agents: {len(agents_data)}")
-            agents = np.zeros((1, len(agents_data), self.frames, 3))  # Format: [batch, agent, time, features]
-            agents_mask = np.ones((1, len(agents_data), self.frames, 1))
-            agents_dim = np.zeros((1, len(agents_data), 2))
-            
-            for i, agent in enumerate(agents_data):
-                agents[0, i, :, 0:2] = agent['position'][0:2]  # x, y position
-                agents[0, i, :, 2] = agent['heading']  # heading
-                agents_dim[0, i, 0:2] = agent['dimensions'][0:2]  # length, width
-            
-            # Ego vehicle trajectory prediction (simplified)
-            ego_pred = np.zeros((1, self.frames, 2))  # frames timesteps of predicted trajectory
-            dt = 0.1  # prediction time step
-            for i in range(self.frames):
-                ego_pred[0, i, 0] = ego_pos[0] + ego_vel[0] * dt * i
-                ego_pred[0, i, 1] = ego_pos[1] + ego_vel[1] * dt * i
-                
-            
-            # Create state dictionary for Tree
-            init_state = {
-                "map": map_data,
-                "map_mask": map_mask,
-                "additional_map": map_data,  # Same as primary map for simplicity
-                "additional_map_mask": map_mask,
-                "agents": agents,
-                "agents_mask": agents_mask,
-                "agents_dim": agents_dim,
-                "ego": ego,
-                "ego_pos": np.array([[[ego_pos[0], ego_pos[1]]]]).reshape(1, 1, 2),
-                "ego_speed": np.array([[[ego_speed]]]).reshape(1, 1, 1),
-                "ego_yaw": np.array([[[ego_heading]]]).reshape(1, 1, 1),
-                "ego_pred": ego_pred,
-                "prediction": np.zeros((1, len(agents_data), 3, 20, 2)),  # [batch, agent, mode, time, xy]
-                "static_objects": np.zeros((1, 0, 2)),  # No static objects for Highway Env
-                "static_objects_dims": np.zeros((1, 0, 3)),
-                "pedestrians": np.zeros((1, 0, 2)),  # No pedestrians in Highway Env
-                "pedestrians_dims": np.zeros((1, 0, 3)),
-                "max_speed": 30.0,  # Maximum allowed speed (m/s)
-                "prior": [None],
-                "start_time": time.time()
-            }
-
-            # Add belief-based predictions for other vehicles if available
-            if hasattr(self, 'belief') and self.belief is not None:
-                # Get trajectory predictions from belief system
-                prediction_horizon = 2.0  # seconds
-                dt = 0.1  # time step
-                trajectory_predictions = self.belief.sample_vehicle_trajectories(prediction_horizon, dt)
-                
-                # Convert to format expected by Tree
-                num_agents = len(trajectory_predictions)
-                if num_agents > 0:
-                    # Get first trajectory to determine shape
-                    first_traj = list(trajectory_predictions.values())[0]
-                    num_timesteps = first_traj.shape[0]
-                    
-                    # Initialize prediction array with shape [batch=1, agent, mode=1, time, xy=2]
-                    predictions = np.zeros((1, num_agents, 1, num_timesteps, 3))
-                    
-                    # Fill in predictions
-                    agent_ids = list(trajectory_predictions.keys())
-                    for i, vehicle_id in enumerate(agent_ids):
-                        trajectory = trajectory_predictions[vehicle_id]
-                        predictions[0, i, 0, :, :] = trajectory
-                    
-                    # Add to state dictionary
-                    init_state["prediction"] = predictions
-
-            # print(f"====== Initial State ======")
-            # # print(f"Agents: {agents}")
-            # # print("==============================")
-            # # print dimensions of the state
-            # # print(f"====== State dimensions ======")
-            # print(f"Map shape: {init_state['map'].shape}")
-            # print(f"Map mask shape: {init_state['map_mask'].shape}")
-            # print(f"Agents shape: {init_state['agents'].shape}")
-            # print(f"Agents mask shape: {init_state['agents_mask'].shape}")
-            # print(f"Agents dim shape: {init_state['agents_dim'].shape}")
-            # print(f"Ego shape: {init_state['ego'].shape}")
-            # print(f"Ego position shape: {init_state['ego_pos'].shape}")
-            # print(f"Ego speed shape: {init_state['ego_speed'].shape}")
-            # print(f"Ego yaw shape: {init_state['ego_yaw'].shape}")
-            # print(f"Ego prediction shape: {init_state['ego_pred'].shape}")
-            # print(f"Prediction shape: {init_state['prediction'].shape}")
-            # print(f"Static objects shape: {init_state['static_objects'].shape}")
-            # print(f"Static objects dims shape: {init_state['static_objects_dims'].shape}")
-            # print(f"Pedestrians shape: {init_state['pedestrians'].shape}")
-            # print(f"Pedestrians dims shape: {init_state['pedestrians_dims'].shape}")
-            # print(f"Max speed: {init_state['max_speed']}")
-            # print(f"Prior shape: {len(init_state['prior'])}")
-            # print(f"Start time: {init_state['start_time']}")
-            # print(f"==============================")
-
-            return init_state
-        else:
-            # Default state if road not available
-            return {
-                "map": np.zeros((1, 0, 2)),
-                "map_mask": np.zeros((1, 0, 1)),
-                "additional_map": np.zeros((1, 0, 2)),
-                "additional_map_mask": np.zeros((1, 0, 1)),
-                "agents": np.zeros((1, 0, 1, 5)),
-                "agents_mask": np.zeros((1, 0, 1, 1)),
-                "agents_dim": np.zeros((1, 0, 3)),
-                "ego_pos": np.array([[[0, 0]]]),
-                "ego_speed": np.array([[[0]]]),
-                "ego_yaw": np.array([[[0]]]),
-                "ego_pred": np.zeros((1, 10, 2)),
-                "prediction": np.zeros((1, 0, 3, 20, 2)),
-                "static_objects": np.zeros((1, 0, 2)),
-                "static_objects_dims": np.zeros((1, 0, 3)),
-                "pedestrians": np.zeros((1, 0, 2)),
-                "pedestrians_dims": np.zeros((1, 0, 3)),
-                "max_speed": 30.0,
-                "prior": [None],
-                "start_time": time.time()
-            }
+        return False # By default, not completed until timeout or specific condition.
 
     def _get_observation(self):
-        """Convert current state to text observation for MCTS"""
-
         if self.env_scenario is not None:
-            # Use the scenario's observation method
-            return self.env_scenario.describe(0)
+            # Ensure ego vehicle is available for scenario description
+            if hasattr(self.env.unwrapped, 'vehicle') and self.env.unwrapped.vehicle:
+                 return self.env_scenario.describe(0) # Assuming ego is agent 0
+            else: # Fallback if ego vehicle not ready
+                return "Ego vehicle not available for scenario description."
 
-        if not hasattr(self.env.unwrapped, 'vehicle'):
+
+        if not hasattr(self.env.unwrapped, 'vehicle') or not self.env.unwrapped.vehicle:
             return "No vehicle information available."
         
-        # Get vehicle and road information
         vehicle = self.env.unwrapped.vehicle
-        speed = getattr(vehicle, 'speed', 0.0)  # Convert m/s to km/h
-        current_lane = getattr(vehicle, 'lane_index', None)
-        total_lanes = getattr(self.env.unwrapped.road, 'lanes_count', 0)
-        
-        # Create initial observation text
-        observation = f"Ego vehicle in lane {current_lane[2]} of {total_lanes} lanes.  "
-        observation += f"moving at {speed:.1f} m/h with heading {vehicle.heading:.1f} radians. "
-        observation += f"Currently in lane {current_lane[2]}. "
+        speed = getattr(vehicle, 'speed', 0.0) 
+        current_lane_tuple = getattr(vehicle, 'lane_index', None) # e.g., ('o', 'e', 0)
+        current_lane_idx = current_lane_tuple[2] if current_lane_tuple else -1
 
-        def calculate_distance(x, y):
-            temp_x = x - vehicle.position[0]
-            temp_y = y - vehicle.position[1]
-            return np.sqrt(temp_x**2 + temp_y**2)
+        total_lanes = 0
+        if hasattr(self.env.unwrapped, 'road') and self.env.unwrapped.road:
+            total_lanes = getattr(self.env.unwrapped.road, 'lanes_count', 0)
+            if total_lanes == 0 and hasattr(self.env.unwrapped.road.network, 'lanes_on_road'):
+                # Try to get from network if road.lanes_count is 0 or not set
+                lanes_on_road = self.env.unwrapped.road.network.lanes_on_road(vehicle.position)
+                if lanes_on_road: total_lanes = len(set(idx[2] for idx in lanes_on_road))
 
-        # Add other vehicles information
+
+        observation = f"Ego vehicle in lane {current_lane_idx} of {total_lanes} lanes. "
+        observation += f"Moving at {speed:.1f} m/s with heading {vehicle.heading:.2f} rad. "
+
         other_vehicles = []
-        if hasattr(self.env.unwrapped, 'road'):
-            other_vehicles = [v for v in self.env.unwrapped.road.vehicles if v is not vehicle]
+        if hasattr(self.env.unwrapped, 'road') and self.env.unwrapped.road:
+            # Get vehicles sorted by distance, excluding ego
+            other_vehicles_raw = self.env.unwrapped.road.close_vehicles_to(
+                vehicle, 
+                self.env.unwrapped.config.get("observation", {}).get("vehicles_count", 5) * 20.0, # perception distance
+                count=self.env.unwrapped.config.get("observation", {}).get("vehicles_count", 5) -1, # count for others
+                see_behind=True,
+                sort='sorted'
+            )
+            other_vehicles = [v for v in other_vehicles_raw if v is not vehicle]
             
             observation += f"There are {len(other_vehicles)} other vehicles nearby. "
             
-            for i, other_vehicle in enumerate(other_vehicles):
-                if hasattr(other_vehicle, 'position') and hasattr(other_vehicle, 'speed'):
-                    vehicle_id = id(other_vehicle) % 1000
-                    lane_idx = other_vehicle.lane_index[2]
-                    other_speed = getattr(other_vehicle, 'speed', 0.0)
-                    observation += f"Vehicle {vehicle_id} in lane {lane_idx}. "
-                    observation += f"Distance to ego vehicle: {calculate_distance(other_vehicle.position[0], other_vehicle.position[1]):.1f} m. "
-                    if other_speed == speed:
-                        observation += f"Moving at the same speed. "
-                    elif other_speed > speed:
-                        observation += f"Moving faster than ego. "
-                    else:
-                        observation += f"Moving slower than ego. "
+            for i, other_v in enumerate(other_vehicles):
+                if hasattr(other_v, 'position') and hasattr(other_v, 'speed'):
+                    other_v_id = id(other_v) % 1000
+                    other_lane_tuple = getattr(other_v, 'lane_index', None)
+                    other_lane_idx = other_lane_tuple[2] if other_lane_tuple else -1
+                    other_speed = getattr(other_v, 'speed', 0.0)
+                    dist_to_ego = np.linalg.norm(np.array(other_v.position) - np.array(vehicle.position))
+
+                    observation += f"Vehicle {other_v_id} in lane {other_lane_idx}, dist: {dist_to_ego:.1f}m. "
+                    if other_speed > speed + 1.0: observation += "Faster. "
+                    elif other_speed < speed - 1.0: observation += "Slower. "
+                    else: observation += "Similar speed. "
                     
-                if self.belief_states and vehicle_id in self.belief_states:
-                    belief_state = self.belief_states[vehicle_id]
-                    print(f"vehicle_id: {vehicle_id}, predicted action: {belief_state['predicted_actions']}")
-                    observation += f"Posible action about vehicle {vehicle_id}: {belief_state['predicted_actions']}. "   
-                
-        
-        # Add navigation information
-        nav_info = self._get_navigation_info()
-        # observation += f"Next road option: {nav_info['road_option']}. "
-        # observation += f"Target speed: {nav_info['target_speed'] * 3.6} km/h. "
-        
+                    if self.belief_states and other_v_id in self.belief_states:
+                        belief_state = self.belief_states[other_v_id]
+                        if belief_state.get('predicted_actions'):
+                            pred_actions = belief_state['predicted_actions']
+                            if isinstance(pred_actions, dict) and 'most_likely' in pred_actions:
+                                observation += f"Predicted: {pred_actions['most_likely']}. "
+                            elif isinstance(pred_actions, (list, np.ndarray)): # if it's a distribution
+                                 # Find most likely action from distribution if not already processed
+                                 action_names = self._get_action_space() # Assuming this returns list of names
+                                 if len(pred_actions) == len(action_names):
+                                     most_likely_idx = np.argmax(pred_actions)
+                                     observation += f"Predicted: {action_names[most_likely_idx]}. "
+                                 else:
+                                     observation += f"Predicted actions available (raw: {pred_actions}). "
+                            else:
+                                observation += f"Predicted actions available (raw: {pred_actions}). "
         return observation
 
     def render(self, mode='human'):
-        """Render the environment"""
         if self.env:
-            img = self.env.render(mode=mode)
-            # Update front camera image with rendered frame
-            if mode == 'rgb_array':
+            # Ensure render_mode is compatible if 'human' is requested but env is 'rgb_array'
+            current_render_mode = self.env.render_mode
+            if mode == 'human' and current_render_mode == 'rgb_array':
+                # print("Cannot render in 'human' mode if env is 'rgb_array'. Returning array.")
+                img = self.env.render() # Will use its native mode
+            else: # if mode is 'rgb_array' or matches env's mode
+                img = self.env.render() # Call with env's configured mode or requested 'rgb_array'
+            
+            if isinstance(img, np.ndarray): # If render returns an array
                 self.camera_images['front'] = img
             return img
         return None
 
     def _capture_current_state(self):
-        """
-        Capture the current state of the environment
-        
-        Returns:
-            state: Dictionary of current state
-        """
-        # Create state object to store environment state
         state = EnvironmentState()
-        
-        # Extract ego vehicle state
         if self.ego_vehicle:
             state.vehicle_state = {
-                'position': self.ego_vehicle.position,
-                'velocity': self.ego_vehicle.velocity,
-                'heading': self.ego_vehicle.heading,
-                'speed': self.ego_vehicle.speed,
+                'position': self.ego_vehicle.position, 'velocity': self.ego_vehicle.velocity,
+                'heading': self.ego_vehicle.heading, 'speed': self.ego_vehicle.speed,
                 'lane_index': self.ego_vehicle.lane_index if hasattr(self.ego_vehicle, 'lane_index') else None,
                 'lane': self.ego_vehicle.lane_index[2] if hasattr(self.ego_vehicle, 'lane_index') else -1
             }
         
-        # Extract information about other vehicles
         if hasattr(self.env.unwrapped, 'road') and hasattr(self.env.unwrapped.road, 'vehicles'):
-            other_vehicles = [v for v in self.env.unwrapped.road.vehicles if v is not self.ego_vehicle]
-            
-            for i, vehicle in enumerate(other_vehicles):
-                vehicle_id = id(vehicle) % 1000
-                if hasattr(vehicle, 'position') and hasattr(vehicle, 'velocity'):
-                    state.env_state[vehicle_id] = {
-                        'position': vehicle.position,
-                        'velocity': vehicle.velocity,
-                        'heading': vehicle.heading if hasattr(vehicle, 'heading') else 0.0,
-                        'speed': vehicle.speed if hasattr(vehicle, 'speed') else np.linalg.norm(vehicle.velocity),
-                        'lane_index': vehicle.lane_index if hasattr(vehicle, 'lane_index') else None,
-                        'lane': vehicle.lane_index[2] if hasattr(vehicle, 'lane_index') else -1,
+            other_vehicles_list = [v for v in self.env.unwrapped.road.vehicles if v is not self.ego_vehicle]
+            for vehicle_obj in other_vehicles_list:
+                v_id = id(vehicle_obj) % 1000
+                if hasattr(vehicle_obj, 'position') and hasattr(vehicle_obj, 'velocity'):
+                    state.env_state[v_id] = {
+                        'position': vehicle_obj.position, 'velocity': vehicle_obj.velocity,
+                        'heading': getattr(vehicle_obj, 'heading', 0.0),
+                        'speed': getattr(vehicle_obj, 'speed', np.linalg.norm(vehicle_obj.velocity)),
+                        'lane_index': getattr(vehicle_obj, 'lane_index', None),
+                        'lane': getattr(vehicle_obj, 'lane_index', (None,None,-1))[2],
                         'type': 'vehicle'
                     }
         
-        # Extract road and traffic information for the belief system
-        if hasattr(self.env.unwrapped, 'road'):
+        if hasattr(self.env.unwrapped, 'road') and self.env.unwrapped.road:
+            road_config = self.env.unwrapped.config
             state.env_state['road'] = {
-                'lanes_count': self.env.unwrapped.config.get("lanes_count", 0),
-                'lanes': [(lane.index, lane.length, lane.width) 
-                         for lane in self.env.unwrapped.road.network.lanes]
-                         if hasattr(self.env.unwrapped.road.network, 'lanes') else []
+                'lanes_count': road_config.get("lanes_count", 0),
+                'lanes': [] # Placeholder, fill if detailed lane geometry is needed by belief
             }
-        
+            if hasattr(self.env.unwrapped.road.network, 'lanes'):
+                 state.env_state['road']['lanes'] = [
+                     (lane.index, lane.length, lane.width) for lane in self.env.unwrapped.road.network.lanes
+                 ]
         return state
     
     def _update_belief_state(self, current_state, episode=None, step=None):
-        """
-        Update the belief state based on current observations
+        if self.belief is None:
+            self.belief = Belief(
+                road_graph=self.road_network if self.road_network else (self.env.unwrapped.road if hasattr(self.env.unwrapped, 'road') else None),
+                ego_vehicle_id=self.ego_vehicle_id,
+                forget_rate=0.05 
+            )
         
-        Args:
-            current_state: Current environment state
-        """
-        # Initialize belief system if not already done
-        self.belief = Belief(
-            road_graph=self.env.unwrapped.road if hasattr(self.env.unwrapped, 'road') else None,
-            ego_vehicle_id=self.ego_vehicle_id,
-            forget_rate=0.05  # Adjust as needed
-        )
+        vehicle_states_for_belief_agent = {}
+        agent_ids_list = []
         
-        # Extract vehicle states in the format expected by OtherVehicleAgent
-        vehicle_states = {}
-        agent_ids = []
-        
-        for vehicle_id, vehicle_data in current_state.env_state.items():
-            if isinstance(vehicle_id, int) and vehicle_id != self.ego_vehicle_id:
-                # Only process vehicles, not road or other environment elements
-                if vehicle_data.get('type') == 'vehicle':
-                    agent_ids.append(vehicle_id)
-                    
-                    # Extract relevant state information for the belief system
-                    vehicle_states[vehicle_id] = {
-                        'lane': vehicle_data.get('lane', -1),
-                        'speed': vehicle_data.get('speed', 0.0),  # Convert to km/h
-                        'position': vehicle_data.get('position'),
-                        'heading': vehicle_data.get('heading', 0.0)
-                    }
-        
-        self.agent_ids = agent_ids
+        for v_id, v_data in current_state.env_state.items():
+            if isinstance(v_id, int) and v_id != self.ego_vehicle_id and v_data.get('type') == 'vehicle':
+                agent_ids_list.append(v_id)
+                vehicle_states_for_belief_agent[v_id] = {
+                    'lane': v_data.get('lane', -1), 'speed': v_data.get('speed', 0.0),
+                    'position': v_data.get('position'), 'heading': v_data.get('heading', 0.0)
+                }
+        self.agent_ids = agent_ids_list
 
-        # Create or update OtherVehicleAgent to maintain beliefs about other vehicles
-        if not hasattr(self, 'belief_agent') or self.belief_agent is None:
-            self.belief_agent = OtherVehicleAgent(self.model, self.action_space, vehicle_states, agent_ids, self.belief)
-        else:
-            # Update existing belief agent with new observations
-            self.belief_agent.current_states = vehicle_states
-            self.belief_agent.agent_ids = agent_ids
-            self.belief_agent.belief = self.belief
+        if self.model: # Only init/update belief_agent if VLM model is present
+            if self.belief_agent is None:
+                self.belief_agent = OtherVehicleAgent(self.model, self.action_space, 
+                                                    vehicle_states_for_belief_agent, 
+                                                    self.agent_ids, self.belief)
+            else:
+                self.belief_agent.current_states = vehicle_states_for_belief_agent
+                self.belief_agent.agent_ids = self.agent_ids
+                self.belief_agent.belief = self.belief # Ensure belief is current
         
-        # Update belief system with new observations
-        observation = {
-            'timestamp': self.timestep,
-            'vehicles': {
-                vehicle_id: {
-                    'position': data.get('position'),
-                    'velocity': data.get('velocity'),
-                    'heading': data.get('heading', 0.0),
-                    'lane_id': data.get('lane', -1)
+        observation_for_belief_update = {'timestamp': self.timestep, 'vehicles': {}}
+        for v_id, data in current_state.env_state.items():
+            if isinstance(v_id, int) and v_id != self.ego_vehicle_id and data.get('type') == 'vehicle':
+                observation_for_belief_update['vehicles'][v_id] = {
+                    'position': data.get('position'), 'velocity': data.get('velocity'),
+                    'heading': data.get('heading', 0.0), 'lane_id': data.get('lane', -1)
                 }
-                for vehicle_id, data in current_state.env_state.items()
-                if isinstance(vehicle_id, int) and vehicle_id != self.ego_vehicle_id
-                and data.get('type') == 'vehicle'
+        
+        if 'road' in current_state.env_state and 'lanes' in current_state.env_state['road']:
+            road_cfg = self.env.unwrapped.config
+            observation_for_belief_update['lanes'] = {
+                i: {'drivable': 1.0, 
+                    'speed_limit': road_cfg.get("reward_speed_range", [20,30])[1],
+                    'width': lane_geom[2] if len(lane_geom) > 2 else 4.0 }
+                for i, lane_geom in enumerate(current_state.env_state['road']['lanes'])
             }
-        }
+        self.belief.update_from_observation(observation_for_belief_update)
         
-        # Add lane information to observation
-        if 'road' in current_state.env_state:
-            observation['lanes'] = {
-                i: {
-                    'drivable': 1.0,
-                    'speed_limit': self.env.unwrapped.config.get("reward_speed_range", [20, 30])[1],
-                    'width': lane[2] if len(lane) > 2 else 4.0
-                }
-                for i, lane in enumerate(current_state.env_state['road'].get('lanes', []))
-            }
+        if self.belief_agent: # Only call get_action if belief_agent exists
+            self.belief_agent.get_action(episode, step)
         
-        # Update belief with observation
-        self.belief.update_from_observation(observation)
-        
-        # Generate action probabilities for other vehicles
-        self.belief_agent.get_action(episode, step)
-        
-        # Store belief states for planning
         self.belief_states = {
-            vehicle_id: {
-                'position': self.belief.vehicle_beliefs.get(vehicle_id, {}).get('position'),
-                'velocity': self.belief.vehicle_beliefs.get(vehicle_id, {}).get('velocity'),
-                'heading': self.belief.vehicle_beliefs.get(vehicle_id, {}).get('heading'),
-                'predicted_actions': self.belief.vehicle_beliefs.get(vehicle_id, {}).get('predicted_actions', {})
-            }
-            for vehicle_id in agent_ids
+            v_id: {
+                'position': self.belief.vehicle_beliefs.get(v_id, {}).get('position'),
+                'velocity': self.belief.vehicle_beliefs.get(v_id, {}).get('velocity'),
+                'heading': self.belief.vehicle_beliefs.get(v_id, {}).get('heading'),
+                'predicted_actions': self.belief.vehicle_beliefs.get(v_id, {}).get('predicted_actions', {})
+            } for v_id in self.agent_ids
         }
-    
+
     def _assess_risk(self):
-        """
-        Assess the risk level of the current state using the belief system
-        
-        Returns:
-            risk_assessment: Dictionary with risk levels for nearby vehicles
-        """
-        if not hasattr(self, 'belief') or self.belief is None:
-            return {'overall_risk': 0.0, 'vehicles': {}}
-        
-        # Generate a simple ego trajectory prediction based on current velocity
+        if not self.belief: return {'overall_risk': 0.0, 'vehicles': {}}
         if self.ego_vehicle and hasattr(self.ego_vehicle, 'position') and hasattr(self.ego_vehicle, 'velocity'):
-            dt = 0.1  # Prediction time step
-            steps = 10  # Prediction horizon
-            ego_trajectory = np.array([
-                self.ego_vehicle.position + self.ego_vehicle.velocity * dt * i
-                for i in range(steps)
-            ])
-        else:
-            # If no ego vehicle, return minimal risk assessment
-            return {'overall_risk': 0.0, 'vehicles': {}}
+            dt = 0.1; steps = 10
+            ego_traj = np.array([self.ego_vehicle.position + self.ego_vehicle.velocity * dt * i for i in range(steps)])
+        else: return {'overall_risk': 0.0, 'vehicles': {}}
         
-        # Get collision probabilities from belief system
-        collision_probs = self.belief.get_collision_probabilities(ego_trajectory)
-        
-        # Identify risky vehicles
-        risky_vehicles = self.belief.get_risky_vehicles(threshold=0.3)
-        
-        # Calculate overall risk level
+        collision_probs = self.belief.get_collision_probabilities(ego_traj)
+        risky_vehicles = self.belief.get_risky_vehicles(threshold=0.3) # Uses its own ego_traj generation
         overall_risk = max([0.0] + [probs.get('probability', 0.0) for probs in collision_probs.values()])
-        
-        # Prepare detailed risk assessment
-        risk_assessment = {
-            'overall_risk': overall_risk,
-            'risky_vehicles': risky_vehicles,
-            'vehicles': collision_probs
-        }
-        
-        return risk_assessment
+        return {'overall_risk': overall_risk, 'risky_vehicles': risky_vehicles, 'vehicles': collision_probs}
     
-    def _execute_action(self, action):
-        """
-        Execute an action in the environment
+    def _calculate_reward(self, action_hl_name): # MCTS simulation reward
+        # This reward is for MCTS rollouts, not the primary reward for DQN training.
+        # DQN uses the reward directly from env.step().
+        if not hasattr(self.env.unwrapped, 'vehicle') or not self.env.unwrapped.vehicle: return 0.0
         
-        Args:
-            action: Action to execute (continuous or discrete)
-        """
-        # Convert action to control format expected by Highway-Env
-        control = self._action_to_control(action)
+        # Use info from the actual (simulated) ego vehicle state if available
+        ego_v = self.env.unwrapped.vehicle
+        speed = ego_v.speed
+        target_speed_range = self.config.get("reward_speed_range", [20, 30])
+        collision = ego_v.crashed if hasattr(ego_v, 'crashed') else False # Check 'crashed' status
+        on_road = ego_v.on_road if hasattr(ego_v, 'on_road') else True
         
-        # Apply control to environment
-        self.env.unwrapped.vehicle.act(control)
-    
-    def _calculate_reward(self, action):
-        """
-        Calculate reward for the current state and action
-        
-        Args:
-            action: Action taken
-            
-        Returns:
-            reward: Calculated reward value
-        """
-        # Extract components for reward calculation
-        if not hasattr(self.env.unwrapped, 'vehicle'):
-            return 0.0
-            
-        speed = self.env.unwrapped.vehicle.speed
-        target_speed_range = self.env.unwrapped.config.get("reward_speed_range", [20, 30])
-        min_speed, max_speed = target_speed_range
-        
-        # Check if collision occurred
-        collision = self.env.unwrapped._is_terminal_for_other_vehicle_collision() if hasattr(self.env.unwrapped, '_is_terminal_for_other_vehicle_collision') else False
-        
-        # Check if out of road
-        on_road = self.env.unwrapped.vehicle.on_road if hasattr(self.env.unwrapped.vehicle, 'on_road') else True
-        
-        # Get risk assessment from belief system
-        risk = self._assess_risk()
-        
-        # Calculate reward components
-        speed_reward = 0.0
-        if min_speed <= speed <= max_speed:
-            # Normalized speed reward when within target range
-            speed_reward = (speed - min_speed) / (max_speed - min_speed)
-        elif speed < min_speed:
-            # Penalty for too slow
-            speed_reward = -0.5 * (min_speed - speed) / min_speed
-        else:
-            # Penalty for too fast
-            speed_reward = -0.5 * (speed - max_speed) / max_speed
-        
-        # Safety penalty from belief system
-        risk_penalty = -2.0 * risk.get('overall_risk', 0.0)
-        
-        # Severe penalties for collision or going off-road
+        # Speed reward
+        speed_reward = 0
+        if target_speed_range[0] <= speed <= target_speed_range[1]:
+            speed_reward = 1.0
+        elif speed < target_speed_range[0]:
+            speed_reward = speed / target_speed_range[0] # Penalize being too slow
+        else: # speed > target_speed_range[1]
+            speed_reward = max(0, 1.0 - (speed - target_speed_range[1]) / (target_speed_range[1] * 0.5)) # Penalize overspeeding
+
+        # Penalties
         collision_penalty = -10.0 if collision else 0.0
         off_road_penalty = -5.0 if not on_road else 0.0
         
-        # Progress reward if applicable
-        progress_reward = 0.0
-        if hasattr(self, 'goal_checker') and self.goal_checker and hasattr(self.env.unwrapped, 'vehicle'):
-            # Calculate progress toward goal
-            distance_to_goal = self.goal_checker.get_distance_to_goal(self.env.unwrapped.vehicle)
-            if hasattr(self, '_prev_distance_to_goal'):
-                progress_made = self._prev_distance_to_goal - distance_to_goal
-                progress_reward = max(0, progress_made)
-            self._prev_distance_to_goal = distance_to_goal
+        # Action related reward (e.g., penalize harsh braking if not needed)
+        action_reward = 0.0
+        if action_hl_name == 'brake' and speed > 5: # Gentle brake is fine
+            action_reward = -0.1 * (speed / target_speed_range[1]) # Penalize braking at high speed
         
-        # Combine reward components with weights
+        # Progress (can be complex, e.g., distance to goal or lane progress)
+        # For MCTS simulation, a simple speed-based progress can work
+        progress_reward = speed / target_speed_range[1] if speed <= target_speed_range[1] else 1.0
+        
         total_reward = (
-            self.reward_weights.get('efficiency', 1.0) * speed_reward +
-            self.reward_weights.get('safety', 10.0) * (risk_penalty + collision_penalty + off_road_penalty) +
-            self.reward_weights.get('progress', 1.0) * progress_reward
+            self.reward_weights['efficiency'] * speed_reward +
+            self.reward_weights['safety'] * (collision_penalty + off_road_penalty) +
+            self.reward_weights['progress'] * progress_reward +
+            self.reward_weights['comfort'] * action_reward # Comfort can be related to action smoothness
         )
-        
         return float(total_reward)
-    
-    def _check_task_completion(self):
-        """
-        Check if the current task is completed
         
-        Returns:
-            done: Whether the task is completed
-        """
-        # Check if environment reports episode termination
-        if hasattr(self.env.unwrapped, 'done'):
-            return self.env.unwrapped.done
-        
-        # Check for collisions
-        collision = self.env.unwrapped._is_terminal_for_other_vehicle_collision() if hasattr(self.env.unwrapped, '_is_terminal_for_other_vehicle_collision') else False
-        
-        # Check if vehicle is off-road
-        off_road = not self.env.unwrapped.vehicle.on_road if hasattr(self.env.unwrapped.vehicle, 'on_road') else False
-        
-        # Check if goal has been reached
-        goal_reached = False
-        if hasattr(self, 'goal_checker') and self.goal_checker:
-            goal_reached = self.goal_checker.check_goal(self.env.unwrapped.vehicle)
-        
-        # Consider task completed if collision, off-road, or goal reached
-        return collision or off_road or goal_reached
-    
-    def get_valid_actions(self):
-        """
-        Get valid actions for the current state
-        
-        Returns:
-            valid_actions: List of valid actions
-        """
-        # Default high-level actions for Highway-Env
-        default_actions = ["keeping_lane", "left_change", "right_change"]
-        
-        # Filter actions based on current state
+    def get_valid_actions(self): # High-level valid actions
+        default_actions = list(self._get_action_space().keys())
         valid_actions = default_actions.copy()
-        
-        # Remove turning actions if not at an intersection
-        if not self._is_at_intersection():
-            valid_actions = [a for a in valid_actions if "turning" not in a]
-        
-        # Remove lane change actions if not appropriate
+        # Add logic to prune actions based on env state if needed (e.g., no left_change from leftmost lane)
         if self.ego_vehicle and hasattr(self.ego_vehicle, 'lane_index'):
-            lane_idx = self.ego_vehicle.lane_index[2]
-            lane_count = self.env.unwrapped.config.get("lanes_count", 3)
-            
-            # Can't change left from leftmost lane
-            if lane_idx == 0:
-                valid_actions = [a for a in valid_actions if "left_change" not in a]
-                
-            # Can't change right from rightmost lane
-            if lane_idx == lane_count - 1:
-                valid_actions = [a for a in valid_actions if "right_change" not in a]
-        
+            lane_idx_tuple = self.ego_vehicle.lane_index
+            if lane_idx_tuple:
+                current_lane_idx_val = lane_idx_tuple[2]
+                num_lanes = self.config.get("lanes_count", 3)
+
+                if current_lane_idx_val == 0: # Leftmost lane
+                    if "left_change" in valid_actions: valid_actions.remove("left_change")
+                    if "turning_left" in valid_actions: valid_actions.remove("turning_left") # If turns imply lane change
+                if current_lane_idx_val == num_lanes - 1: # Rightmost lane
+                    if "right_change" in valid_actions: valid_actions.remove("right_change")
+                    if "turning_right" in valid_actions: valid_actions.remove("turning_right")
         return valid_actions
     
-    def _is_at_intersection(self):
-        """Check if the vehicle is at an intersection"""
-        # Highway-Env typically doesn't have intersections in highway scenarios
-        # For scenarios like intersection-v0, we would implement this differently
-        return True
+    def _is_at_intersection(self): # Placeholder
+        return False # Most highway-v0 scenarios don't have functional intersections for MCTS decisions
     
-    def _get_navigation_info(self):
-        """Get navigation information for planning"""
-        # Get current waypoint
-        if not hasattr(self.env.unwrapped, 'vehicle') or not hasattr(self.env.unwrapped, 'road'):
-            return {
-                'road_option': 'STRAIGHT',
-                'target_speed': 30.0,
-                'distance_to_goal': float('inf')
-            }
-        
-        vehicle = self.env.unwrapped.vehicle
-        
-        # Determine road option (lane following direction)
-        road_option = 'STRAIGHT'  # Default
-        
-        # For lane changes, determine direction based on neighboring vehicles
-        if hasattr(vehicle, 'lane_index') and hasattr(self.env.unwrapped.road, 'network'):
-            lane_idx = vehicle.lane_index[2]
-            lane_count = self.env.unwrapped.config.get("lanes_count", 3)
-            
-            # Check for vehicles in current lane
-            vehicles_in_lane = [v for v in self.env.unwrapped.road.vehicles 
-                               if v is not vehicle and hasattr(v, 'lane_index') 
-                               and v.lane_index[2] == lane_idx
-                               and v.position[0] > vehicle.position[0]  # vehicle ahead
-                               and v.position[0] - vehicle.position[0] < 50]  # within reasonable distance
-            
-            if vehicles_in_lane:
-                # Consider changing lanes if vehicles ahead
-                if lane_idx > 0:  # Can change left
-                    left_lane_vehicles = [v for v in self.env.unwrapped.road.vehicles 
-                                         if v is not vehicle and hasattr(v, 'lane_index') 
-                                         and v.lane_index[2] == lane_idx - 1]
-                    if not left_lane_vehicles:
-                        road_option = 'LEFT_CHANGE'
-                
-                if lane_idx < lane_count - 1 and road_option == 'STRAIGHT':  # Can change right and haven't chosen left
-                    right_lane_vehicles = [v for v in self.env.unwrapped.road.vehicles 
-                                          if v is not vehicle and hasattr(v, 'lane_index') 
-                                          and v.lane_index[2] == lane_idx + 1]
-                    if not right_lane_vehicles:
-                        road_option = 'RIGHT_CHANGE'
-        
-        # Get distance to goal if available
-        distance_to_goal = float('inf')
-        if hasattr(self, 'goal_checker') and self.goal_checker:
-            distance_to_goal = self.goal_checker.get_distance_to_goal(vehicle)
-        
-        # Return navigation info
+    def _get_navigation_info(self): # Placeholder for MCTS
         return {
-            'road_option': road_option,
-            'target_speed': self.env.unwrapped.config.get("reward_speed_range", [20, 30])[1],
-            'distance_to_goal': distance_to_goal
+            'road_option': 'STRAIGHT', 
+            'target_speed': self.config.get("reward_speed_range", [20,30])[1],
+            'distance_to_goal': float('inf')
         }
 
-    # def get_vehicle_density(self):
-    #     """Get vehicle density in the environment"""
-    #     if hasattr(self.env.unwrapped, 'road') and hasattr(self.env.unwrapped.road, 'vehicles'):
-    #         vehicles = self.env.unwrapped.road.vehicles
-    #         road_length = self.env.unwrapped.road.length
-    #         vehicle_density = len(vehicles) / road_length if road_length > 0 else 0
-    #         return vehicle_density
-    #     return 0
+    # mcts_step, _copy_state_for_simulation, _simulate_step, _update_belief_with_simulation,
+    # _get_observation_from_state, _check_terminal_state, _action_to_control
+    # These are primarily for MCTS internal simulation and seem okay.
+    # Ensure _calculate_reward used by mcts_step is appropriate for simulated steps.
 
-class StateGraph:
-    """Graph to store environment states and transitions"""
-    def __init__(self):
-        self.nodes = []
-        self.current_node = None
-        self.edges = {}  # Map from node index to list of connected node indices
-        self.node_metadata = {}  # Additional data associated with each node
+    def mcts_step(self, action_hl_name):
+        sim_state = self._copy_state_for_simulation()
+        control_params = self._action_to_control(action_hl_name) # Get [acc, steer] for HL action
+        
+        # Simulate multiple low-level steps for one HL action in MCTS rollout
+        # This makes MCTS rollouts more realistic if HL actions span time.
+        # For simplicity, let's assume one HL action corresponds to one effective change.
+        # A more advanced MCTS would simulate for a short duration.
+        # Here, we apply a simplified kinematic update.
+        sim_next_state = self._simulate_step(sim_state, control_params) # Applies one dt step
+        
+        sim_timestep = self.timestep + 1 # Hypothetical next step
+        # self._update_belief_with_simulation(sim_next_state) # Belief update in simulation can be complex
+        
+        reward = self._calculate_reward(action_hl_name) # Use the MCTS specific reward
+        done = self._check_terminal_state(sim_next_state) # Check terminal conditions in sim
+        observation_text = self._get_observation_from_state(sim_next_state)
+        
+        # History for MCTS needs to be managed carefully if it affects state_id
+        # For now, assume history is a list of HL action names for MCTS state_id
+        # Let's assume high_level_mcts.py handles history for its state IDs.
+        # This history is for the MCTS agent's perspective.
+        sim_history = self.agent_history.copy() # This is LL history
+        mcts_history_hl_actions = [item[0] if isinstance(item[0], str) else "ll_action" for item in sim_history]
+        mcts_history_hl_actions.append(action_hl_name)
 
-    def add_node(self, node):
-        """Add a node to the graph and set it as current"""
-        self.nodes.append(node)
-        node_idx = len(self.nodes) - 1
-        self.current_node = node
+        valid_actions_sim = self.get_valid_actions() # Valid actions from the new sim_state (can be simplified)
         
-        # Initialize edges for new node
-        if node_idx not in self.edges:
-            self.edges[node_idx] = []
+        return observation_text, reward, done, mcts_history_hl_actions, valid_actions_sim
+
+    def _copy_state_for_simulation(self):
+        current_state_obj = self._capture_current_state()
+        return deepcopy(current_state_obj)
+
+    def _simulate_step(self, state_obj, control): # control is [acc, steer]
+        # Simplified kinematic update on a state_obj (EnvironmentState)
+        # This is a very basic forward model for MCTS.
+        dt = 1.0 / self.config.get("policy_frequency", 10) # Time duration of one HL action
+
+        pos = np.array(state_obj.vehicle_state['position'])
+        vel = np.array(state_obj.vehicle_state['velocity'])
+        heading = state_obj.vehicle_state['heading']
+        speed = state_obj.vehicle_state['speed']
+
+        acc, steer = control[0], control[1]
+
+        # Update speed and heading
+        new_speed = speed + acc * dt
+        new_speed = max(0, new_speed) # No negative speed
         
-        # Connect to previous node if exists
-        if node_idx > 0:
-            self.add_edge(node_idx - 1, node_idx)
-            
-        return node_idx
+        # Simplified steering effect: change heading
+        # More accurate model would use bicycle model (speed * tan(steer) / wheelbase)
+        angular_velocity = 0
+        if speed > 0.1: # Avoid division by zero or large changes at low speed
+            wheelbase = self.config.get("wheelbase", 2.5) # Approx vehicle wheelbase
+            angular_velocity = (new_speed / wheelbase) * np.tan(steer) 
         
-    def add_edge(self, from_idx, to_idx):
-        """Add a directed edge between nodes"""
-        if from_idx in self.edges:
-            self.edges[from_idx].append(to_idx)
-            
-    def get_node(self, idx):
-        """Get node by index"""
-        if 0 <= idx < len(self.nodes):
-            return self.nodes[idx]
-        return None
+        new_heading = heading + angular_velocity * dt
+        new_heading = (new_heading + np.pi) % (2 * np.pi) - np.pi # Normalize heading to [-pi, pi]
+
+        # Update velocity vector
+        new_vel_vec = np.array([new_speed * np.cos(new_heading), new_speed * np.sin(new_heading)])
         
-    def find_path(self, start_idx, end_idx):
-        """Find a path between two nodes using BFS"""
-        visited = set()
-        queue = [[start_idx]]
-        
-        if start_idx == end_idx:
-            return [start_idx]
-            
-        while queue:
-            path = queue.pop(0)
-            node = path[-1]
-            
-            if node not in visited:
-                for neighbor in self.edges.get(node, []):
-                    new_path = list(path)
-                    new_path.append(neighbor)
-                    
-                    if neighbor == end_idx:
-                        return new_path
-                        
-                    queue.append(new_path)
-                    
-                visited.add(node)
-                
-        return None  # No path found
-        
-    def add_metadata(self, node_idx, key, value):
-        """Associate metadata with a node"""
-        if node_idx not in self.node_metadata:
-            self.node_metadata[node_idx] = {}
-        self.node_metadata[node_idx][key] = value
-        
-    def get_metadata(self, node_idx, key=None):
-        """Get metadata for a node"""
-        if node_idx not in self.node_metadata:
-            return None
-            
-        if key is None:
-            return self.node_metadata[node_idx]
-        return self.node_metadata[node_idx].get(key)
-        
-    def current_node_idx(self):
-        """Get index of current node"""
-        if self.current_node is None:
-            return None
-        return self.nodes.index(self.current_node)
+        # Update position
+        # Average velocity over dt for position update: (vel + new_vel_vec)/2 * dt
+        # Or simpler: new_pos = pos + new_vel_vec * dt (assuming new_vel_vec is constant over dt)
+        new_pos = pos + vel * dt + 0.5 * np.array([acc * np.cos(heading), acc * np.sin(heading)]) * dt**2 # Kinematic
+        # Or even simpler for MCTS:
+        # new_pos = pos + new_vel_vec * dt
 
 
-class EnvironmentState:
-    """Container for environment state data"""
-    def __init__(self):
-        self.vehicle_state = {}
-        self.env_state = {}
-        self.timestamp = time.time()
+        sim_next_state_obj = deepcopy(state_obj)
+        sim_next_state_obj.vehicle_state['position'] = new_pos
+        sim_next_state_obj.vehicle_state['velocity'] = new_vel_vec
+        sim_next_state_obj.vehicle_state['heading'] = new_heading
+        sim_next_state_obj.vehicle_state['speed'] = new_speed
+        
+        # TODO: Update other vehicle states in sim_next_state_obj.env_state if MCTS needs to reason about them.
+        # For now, MCTS rollouts primarily focus on ego's simulated evolution.
+        return sim_next_state_obj
+
+    def _get_observation_from_state(self, state_obj: EnvironmentState):
+        # Simplified observation for MCTS simulation from an EnvironmentState object
+        vs = state_obj.vehicle_state
+        obs_str = f"SimEgo at {vs['position'][0]:.1f},{vs['position'][1]:.1f}, speed {vs['speed']:.1f}m/s, head {vs['heading']:.2f}rad. "
+        # Could add simplified info about a few other vehicles if state_obj.env_state is populated for them.
+        return obs_str
+
+    def _check_terminal_state(self, state_obj: EnvironmentState):
+        # Simplified terminal check for MCTS simulation
+        # e.g., if ego goes off a predefined road boundary, or speed is too low for too long.
+        # For highway-v0, off-road is a key terminal state.
+        # This requires defining road boundaries or using lane information.
+        # For now, assume not terminal unless a very obvious condition.
+        if state_obj.vehicle_state['speed'] < 0.1 and self.timestep > 100 : # Stuck
+            return True
+        # Add collision check if other vehicles are simulated in state_obj.env_state
+        return False
+
+    def _action_to_control(self, action_hl_name): # Returns [acc, steer] for the HL action
+        if action_hl_name in self.action_space: # self.action_space is from _get_action_space()
+            params = self.action_space[action_hl_name]
+            # These are target values, not ranges for LLM.
+            # For simulation, we can use these directly.
+            return np.array([params['acceleration'], params['steering']])
+        else: # Fallback for unknown action
+            print(f"Warning: Unknown HL action '{action_hl_name}' in _action_to_control. Defaulting.")
+            return np.array([0.0, 0.0]) # Neutral action
+
+    def close(self):
+        if self.env:
+            self.env.close()

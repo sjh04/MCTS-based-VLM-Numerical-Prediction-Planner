@@ -52,6 +52,7 @@ class DQN:
         
         self.action_dim = num_throttle_bins * num_steering_bins # Derived action_dim
 
+        self.state_dim = state_dim  # 状态维度
         self.q_net = Qnet(state_dim, hidden_dim,
                           self.action_dim).to(device)  # Q网络
         # 目标网络
@@ -81,25 +82,19 @@ class DQN:
         discrete_action_idx = throttle_idx * self.num_steering_bins + steering_idx
         return discrete_action_idx
 
-    def take_action(self, state, llm_suggested_continuous_action=None, p_follow_llm=0.0):  # epsilon-贪婪策略采取动作
+    def take_action(self, state, llm_suggested_continuous_action=None, p_follow_llm=0.3):  # epsilon-贪婪策略采取动作
         # defualt llm suggested bias is None
         # llm_suggested_continuous_action should be a tuple (throttle, steering) or None
         # p_follow_llm is the probability of following the LLM's suggestion
         
-        if llm_suggested_continuous_action is not None and \
-           isinstance(llm_suggested_continuous_action, (list, tuple)) and \
-           len(llm_suggested_continuous_action) == 2 and \
-           np.random.random() < p_follow_llm:
-            # Follow LLM suggestion
-            action = self.get_closest_discrete_action(
-                llm_suggested_continuous_action[0],  # throttle
-                llm_suggested_continuous_action[1]   # steering
-            )
-        elif np.random.random() < self.epsilon:
+        if np.random.random() < self.epsilon:
             action = np.random.randint(self.action_dim)
         else:
             state_tensor = torch.tensor([state], dtype=torch.float).to(self.device)
-            action = self.q_net(state_tensor).argmax().item()
+            print("state_tensor", state_tensor.shape)
+            print("state_dim", self.state_dim)
+            action = self.q_net(state_tensor)
+            
         return action
 
     def get_continuous_action_pair(self, discrete_action_idx):

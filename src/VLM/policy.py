@@ -34,7 +34,9 @@ class MacroActionPolicy:
         """
         # Determine environment type
         env_type = detect_environment_type(observation, image)
-        
+        print("==========High-level Action==========")
+        print(f"history_description: {history_description}")
+        print("==========")
         # Build prompt using the appropriate approach for the environment
         prompt = build_macro_action_prompt(
             state_description, 
@@ -43,9 +45,9 @@ class MacroActionPolicy:
             navigation_info,
             env_type
         )
-        print("==========")
-        print(f"high_level Prompt: {prompt}")
-        print("==========")
+        # print("==========High-level Action==========")
+        # print(f"high_level Prompt: {prompt}")
+        # print("==========")
         # Build messages - will use text observation for Highway Environment
         self.messages = build_messages(image=image, prompt=prompt, observation=observation)
         
@@ -140,6 +142,10 @@ def get_mid_level_action(model, state_description, history_description, macro_ac
     # print(f"state_description: {state_description}")
     # print(f"observation: {observation}")
     # Build prompt with environment-specific formatting
+    print("==========Mid-level Action==========")
+    print(f"history_description: {history_description}")
+    print("==========")
+
     prompt = build_mid_action_prompt(
         state_description, 
         history_description, 

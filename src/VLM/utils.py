@@ -168,13 +168,13 @@ def build_macro_action_prompt(state_description: str, history_description: str, 
     return prompt
 
 # build mid action prompt
-def build_mid_action_prompt(state_description: str, history_description: str, macro_action: str, env_type: str = "highway") -> str:
+def build_mid_action_prompt(state_description: str, history_list: List[str], macro_action: str, env_type: str = "highway") -> str:
     """
     Build prompt for mid-level action prediction
     
     Args:
         state_description: Description of current state
-        history_description: Description of action history
+        history_list: List of previous high-level actions
         macro_action: Selected macro action
         env_type: Environment type ("highway" or "carla")
         
@@ -183,13 +183,14 @@ def build_mid_action_prompt(state_description: str, history_description: str, ma
     """
     steering_angle = np.pi/4
 
-    macro_action = translate_high_action2text(macro_action)
+    formatted_history = build_history_description(history_list)
+    macro_action_text = translate_high_action2text(macro_action)
 
-    prompt = f"{state_description}\n\n{history_description}\n\n"
-    prompt += f"Recommonded high-level action: {macro_action}\n\n"
+    prompt = f"{state_description}\n\n{formatted_history}\n\n"
+    prompt += f"Recommended high-level action: {macro_action_text}\n\n"
     
     if env_type.lower() == "highway":
-        prompt += "Based on the Recommonded high-level action and the current state, provide appropriate acceleration and steering angle values.\n"
+        prompt += "Based on the Recommended high-level action and the current state, provide appropriate acceleration and steering angle values.\n"
         prompt += "- Acceleration should be a value between -3 and 3 m/s^2.\n"
         prompt += f"- Steering angle: value between -{round(steering_angle, 2)} (full left) and {round(steering_angle, 2)} (full right)\n"
     else:  # carla
@@ -201,25 +202,27 @@ def build_mid_action_prompt(state_description: str, history_description: str, ma
     return prompt
 
 # Build atomic action prompt
-def build_atomic_action_prompt(state_description: str, history_description: str, high_action: str, mid_action_dict: dict, env_type: str = "highway") -> str:
+def build_atomic_action_prompt(state_description: str, history_list: List[str], high_action: str, mid_action_dict: dict, env_type: str = "highway") -> str:
     """
     Build prompt for atomic action prediction
     
     Args:
         state_description: Description of current state
-        history_description: Description of action history
-        macro_action: Selected macro action
+        history_list: List of previous high-level actions
+        high_action: Selected macro action
+        mid_action_dict: Dictionary of mid-level action parameters
         env_type: Environment type ("highway" or "carla")
         
     Returns:
         Prompt for VLM
     """
-    high_action = translate_high_action2text(high_action)
+    formatted_history = build_history_description(history_list)
+    high_action_text = translate_high_action2text(high_action)
     steering_angle = np.pi/4
-    prompt = f"{state_description}\n\n{history_description}\n\n"
-    prompt += f"Recommanded high-level action: {high_action}\n\n"
+    prompt = f"{state_description}\n\n{formatted_history}\n\n"
+    prompt += f"Recommended high-level action: {high_action_text}\n\n"
     
-    prompt += f"Recommanded mid-level action:\n"
+    prompt += f"Recommended mid-level action:\n"
     if isinstance(mid_action_dict, dict):
         if "acceleration" in mid_action_dict:
             prompt += f"Acceleration: {mid_action_dict['acceleration']} m/s^2\n"
